@@ -74,8 +74,14 @@ public:
 };
 
 enum { P2P_UNRELIABLE = 0, P2P_RELIABLE = 2, CB_SESSION_REQUEST = 1202, CB_CONNECT_FAIL = 1203 };
+enum { CH_GAME = 0, CH_HELLO = 1 }; // canal 1: "cofmp <versao>" de ida e volta, para saber que o tunel do outro lado responde
+enum { FRIEND_IMMEDIATE = 4 };
 static const char* APPID = "223710"; // Cry of Fear
 static const uint32_t MAX_UNRELIABLE = 1200; // acima disso a Steam so aceita envio confiavel
+
+#ifndef COFMP_VERSION
+#define COFMP_VERSION "?"
+#endif
 
 static bool (__cdecl* pInit)();
 static void (__cdecl* pRunCallbacks)();
@@ -126,7 +132,33 @@ public:
 
 static void Send(CSteamID to, const char* data, int len)
 {
-	g_net->SendP2PPacket(to, data, len, (uint32_t)len <= MAX_UNRELIABLE ? P2P_UNRELIABLE : P2P_RELIABLE, 0);
+	g_net->SendP2PPacket(to, data, len, (uint32_t)len <= MAX_UNRELIABLE ? P2P_UNRELIABLE : P2P_RELIABLE, CH_GAME);
+}
+
+static void SendHello(CSteamID to)
+{
+	static const char hello[] = "cofmp " COFMP_VERSION;
+	g_net->SendP2PPacket(to, hello, sizeof(hello), P2P_RELIABLE, CH_HELLO);
+}
+
+// versao que veio no "cofmp <versao>" do outro lado
+static std::string HelloVersion(const char* data, uint32_t len)
+{
+	std::string s(data, strnlen(data, len));
+	return s.compare(0, 6, "cofmp ") ? "" : s.substr(6);
+}
+
+// O jogo (cof.exe) tambem roda como appid 223710 e consome os callbacks da Steam do processo dele, entao o pedido de
+// sessao (P2PSessionRequest) pode nunca chegar aqui. O host aceita por conta propria quem estiver online na lista de amigos.
+static void AcceptFriends()
+{
+	int n = g_friends->GetFriendCount(FRIEND_IMMEDIATE);
+	for (int k = 0; k < n; k++)
+	{
+		CSteamID id = g_friends->GetFriendByIndex(k, FRIEND_IMMEDIATE);
+		if (g_friends->GetFriendPersonaState(id) != 0)
+			g_net->AcceptP2PSessionWithUser(id);
+	}
 }
 
 static SOCKET UdpSocket(uint16_t port)
@@ -191,7 +223,7 @@ int main(int argc, char** argv)
 	SetConsoleOutputCP(CP_UTF8);
 	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("==============================================\n");
-	printf("  Cry of Fear co-op - tunel pela Steam\n");
+	printf("  Cry of Fear co-op - tunel pela Steam (v%s)\n", COFMP_VERSION);
 	printf("==============================================\n\n");
 
 	// a Steam identifica o app pelo steam_appid.txt da pasta atual
@@ -291,14 +323,15 @@ int main(int argc, char** argv)
 		listenSock = UdpSocket(localPort);
 		if (listenSock == INVALID_SOCKET)
 			return Fail("a porta local ja esta em uso (outro tunel aberto?).");
+		DeleteFileA("conectado.txt"); // a janela do jogo (Home) espera este arquivo para mandar o connect
 		printf("  Conectando ao host %s pela Steam...\n\n", Name(g_peer));
-		printf("  No console do Cry of Fear digite:  connect 127.0.0.1:%d\n", localPort);
 		printf("  Deixe esta janela aberta enquanto jogam.\n\n");
 	}
 
 	static char buf[65536];
-	DWORD lastCb = 0, lastStatus = 0;
-	bool wasRelay = false, announced = false;
+	DWORD lastCb = 0, lastStatus = 0, lastHello = 0, lastAccept = 0, start = timeGetTime();
+	bool wasRelay = false, announced = false, hostAnswered = false, warned = false;
+	std::map<uint64_t, bool> greeted; // host: amigos que ja mandaram o "cofmp <versao>"
 	for (;;)
 	{
 		bool busy = false;
@@ -308,14 +341,65 @@ int main(int argc, char** argv)
 			pRunCallbacks();
 			lastCb = now;
 		}
+		if (g_host && now - lastAccept >= 1000)
+		{
+			AcceptFriends();
+			lastAccept = now;
+		}
 
-		// Steam -> jogo
+		// canal do "cofmp <versao>": o join manda ate o host responder; o host responde a cada um
 		uint32_t size;
-		while (g_net->IsP2PPacketAvailable(&size, 0))
+		while (g_net->IsP2PPacketAvailable(&size, CH_HELLO))
 		{
 			CSteamID from;
 			uint32_t got = 0;
-			if (!g_net->ReadP2PPacket(buf, sizeof(buf), &got, &from, 0))
+			if (!g_net->ReadP2PPacket(buf, sizeof(buf), &got, &from, CH_HELLO))
+				break;
+			std::string ver = HelloVersion(buf, got);
+			if (g_host)
+			{
+				g_net->AcceptP2PSessionWithUser(from);
+				SendHello(from);
+				if (!greeted[from.v])
+				{
+					greeted[from.v] = true;
+					printf("  %s abriu o tunel para entrar (v%s).\n", Name(from), ver.c_str());
+					if (ver != COFMP_VERSION)
+						printf("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);
+				}
+			}
+			else if (from.v == g_peer.v && !hostAnswered)
+			{
+				hostAnswered = true;
+				printf("  O tunel do host respondeu (v%s). Entrando no jogo...\n", ver.c_str());
+				if (ver != COFMP_VERSION)
+					printf("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);
+				printf("  Se o jogo nao entrar sozinho, digite no console:  connect 127.0.0.1:%d\n\n", localPort);
+				FILE* cf = fopen("conectado.txt", "w");
+				if (cf)
+					fclose(cf);
+			}
+		}
+		if (!g_host && !hostAnswered && now - lastHello >= 1000)
+		{
+			SendHello(g_peer);
+			lastHello = now;
+			if (!warned && now - start > 20000)
+			{
+				warned = true;
+				printf("  O tunel do host ainda nao respondeu. Confira:\n");
+				printf("   - o codigo e o do host e ele clicou em \"Criar servidor\" (o tunel dele tem que estar aberto);\n");
+				printf("   - os dois estao na mesma versao (esta e a v%s; o host ve a dele na janela do tunel);\n", COFMP_VERSION);
+				printf("   - voces sao amigos na Steam.\n  Continuo tentando...\n\n");
+			}
+		}
+
+		// Steam -> jogo
+		while (g_net->IsP2PPacketAvailable(&size, CH_GAME))
+		{
+			CSteamID from;
+			uint32_t got = 0;
+			if (!g_net->ReadP2PPacket(buf, sizeof(buf), &got, &from, CH_GAME))
 				break;
 			busy = true;
 			if (g_host)

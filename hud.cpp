@@ -35,6 +35,10 @@ enum { WM_HUD_CMD = WM_APP + 0x43 };
 enum { TIMER_POLL = 1, TIMER_CODE, TIMER_CONNECT };
 static const int TUNNEL_PORT = 27020;
 
+#ifndef COFMP_VERSION
+#define COFMP_VERSION "?"
+#endif
+
 // ---------------------------------------------------------------- comandos na thread principal
 
 void Hud_RunPending()
@@ -282,17 +286,31 @@ static void DoJoin()
 		return;
 	}
 	Status(L"Conectando ao host pela Steam...");
-	SetTimer(g_hud, TIMER_CONNECT, 3000, NULL); // da tempo da Steam montar a conexao
+	g_codeStart = GetTickCount();
+	SetTimer(g_hud, TIMER_CONNECT, 250, NULL);
 }
 
+// o tunel grava conectado.txt quando o tunel do host responde; so entao vale mandar o connect
 static void Connect()
 {
-	KillTimer(g_hud, TIMER_CONNECT);
 	if (!TunnelAlive())
 	{
+		KillTimer(g_hud, TIMER_CONNECT);
 		Status(L"O túnel fechou. Confira o código e se a Steam está aberta.");
 		return;
 	}
+	DWORD waited = GetTickCount() - g_codeStart;
+	if (GetFileAttributesA((g_tunnelDir + "\\conectado.txt").c_str()) == INVALID_FILE_ATTRIBUTES)
+	{
+		if (waited < 45000)
+		{
+			if (waited > 15000)
+				Status(L"O host ainda não respondeu. O túnel dele está aberto? Os dois estão na mesma versão?");
+			return;
+		}
+		Status(L"O túnel do host não respondeu. Tentando entrar mesmo assim; veja a janela do túnel.");
+	}
+	KillTimer(g_hud, TIMER_CONNECT);
 	char cmd[64];
 	sprintf(cmd, "connect 127.0.0.1:%d\n", TUNNEL_PORT);
 	Queue(cmd);
@@ -442,7 +460,7 @@ static void CreateHud()
 	const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 	RECT r = { 0, 0, 380, 352 };
 	AdjustWindowRectEx(&r, style, FALSE, ex);
-	g_hud = CreateWindowExW(ex, wc.lpszClassName, L"Cry of Fear co-op", style, 0, 0, r.right - r.left,
+	g_hud = CreateWindowExW(ex, wc.lpszClassName, L"Cry of Fear co-op v" COFMP_VERSION, style, 0, 0, r.right - r.left,
 		r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
 
 	const DWORD S = SS_LEFT, SC = SS_LEFT | SS_CENTERIMAGE, B = WS_TABSTOP | BS_PUSHBUTTON,
@@ -483,7 +501,8 @@ static void CreateHud()
 	Ctl(L"BUTTON", L"Entrar", B, 22, 232, 333, 28, ID_JOIN);
 
 	Ctl(L"STATIC", L"", S, 12, 288, 356, 36, ID_STATUS);
-	Ctl(L"STATIC", L"Home abre e fecha esta janela. Os dois usam a Steam aberta.", S, 12, 328, 356, 18, 0);
+	Ctl(L"STATIC", L"Home abre e fecha esta janela. Os dois usam a Steam aberta.", S, 12, 328, 296, 18, 0);
+	Ctl(L"STATIC", L"v" COFMP_VERSION, SS_RIGHT, 310, 328, 58, 18, 0);
 	SetTimer(g_hud, TIMER_POLL, 30, NULL);
 }
 

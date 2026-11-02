@@ -555,6 +555,22 @@ static void DeleteOld(const std::string& dir)
 	FindClose(h);
 }
 
+// o .old do instalador antigo so pode ser apagado depois que ele fechar (ele espera este terminar):
+// um cmd escondido tenta de novo a cada segundo, por ate 1 minuto
+static void DeleteOldLater(const std::string& dir)
+{
+	std::string old = "\"" + dir + "\\*.old\"";
+	std::string cmd = "cmd.exe /c for /l %i in (1,1,60) do (ping -n 2 127.0.0.1 >nul & del /f /q " + old +
+		" 2>nul & if not exist " + old + " exit)";
+	STARTUPINFOA si = { sizeof(si) };
+	PROCESS_INFORMATION pi;
+	if (CreateProcessA(NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir.c_str(), &si, &pi))
+	{
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	}
+}
+
 // true = atualizou e o instalador novo ja rodou; o main so precisa sair com o codigo em exitCode
 static bool g_onlyUpdate; // --atualizar (ATUALIZAR.bat): atualiza o instalador e o mod do jogo e sai
 
@@ -613,6 +629,7 @@ static bool Update(int& exitCode)
 			continue;
 		}
 		MoveFileA((p + ".new").c_str(), p.c_str());
+		DeleteFileA((p + ".old").c_str()); // so falha se estiver aberto (este exe, ou o tunel rodando)
 	}
 	printf("  Atualizado para a %s!\n", tag[0].c_str());
 
@@ -672,6 +689,11 @@ int main(int argc, char** argv)
 	int exitCode;
 	if (!updated && Update(exitCode))
 		return exitCode;
+	if (updated) // os .old que a versao anterior deixou
+	{
+		DeleteOld(ExeDir());
+		DeleteOldLater(ExeDir());
+	}
 
 	std::string game = FindGame();
 	if (game.empty())
@@ -694,6 +716,12 @@ int main(int argc, char** argv)
 	SyncDll(game);
 	if (g_onlyUpdate)
 	{
+		if (GameRunning())
+		{
+			printf("\n  O Cry of Fear esta aberto, entao o mod dentro do jogo nao foi trocado.\n");
+			printf("  Feche o jogo e rode o ATUALIZAR.bat de novo.\n");
+			return 1;
+		}
 		std::string lib;
 		ReadFile(game + "\\cryoffear\\liblist.gam", lib);
 		if (lib.find(GAMEDLL_MOD) == std::string::npos)

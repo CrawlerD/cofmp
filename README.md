@@ -1,0 +1,98 @@
+# cofmp — campanha do Cry of Fear em co-op
+
+Proxy do server DLL (`hl.dll`). O engine carrega `cofmp.dll`, que repassa todos os exports para `hl.dll` e adiciona a sincronização.
+
+## O que faz (v1)
+- Faz os `trigger_changelevel` do single-player funcionarem em multiplayer. O original sai cedo porque `IsDeathmatch()` sempre retorna 1 em MP.
+- **Saída por toque:** espera todos os jogadores vivos entrarem no volume. Mostra "Aguardando jogadores na saida: X/Y" na tela.
+- **Saída por "use"** (portas, botões): troca de mapa na hora para todos.
+- **Chegada:** cada jogador aparece na mesma posição relativa ao `info_landmark`, como no SP. Jogadores sobrepostos são empurrados para um ponto livre. Quem estava longe (mais de 256 unidades) de quem passou pela saída chega ao lado dele. Isso cobre as portas de transição (`inter_door`), que teleportam só quem abriu para a sala de saída: sem isso, o outro jogador caía no spawn inicial do mapa novo.
+- **Skin do Simon:** o co-op do CoF veste todos de policial. O instalador monta `models\player\simon\simon.mdl` com os arquivos do próprio jogo: a malha e as texturas do Simon (`models\cutscene\player.mdl`) sobre o esqueleto e as animações do `police1.mdl` (os dois usam o mesmo Bip01). O servidor troca o `model` do userinfo de cada jogador para `simon`. Cada PC precisa do arquivo, então o amigo também roda o instalador (a opção 4 já gera o modelo). Sem o arquivo, ele vê os outros de policial.
+- **Inventário entre mapas:** em MP o jogador renasce vazio no mapa novo. Antes da troca, a DLL salva o que cada jogador vivo carrega e devolve tudo 1 s depois de ele nascer:
+  - armas, na mesma ordem dos slots do inventário, com a munição do pente
+  - munição de reserva
+  - a arma que estava na mão
+  - bateria da lanterna e `goodpoints`
+
+  A devolução usa o `GiveNamedItem` do próprio jogo.
+- **Chaves e itens compartilhados:** quando um jogador pega uma chave ou item (`item_key` etc.), todos os jogadores vivos recebem uma cópia, e aparece "X pegou: nome" na tela dos outros. Quando alguém gasta o item numa porta, ele some do inventário de todos. Os itens também vão para o próximo mapa junto com o inventário.
+- **Cutscenes sincronizadas:** quando um `trigger_camera` liga a câmera para um jogador, todos os jogadores vivos veem a mesma câmera (e ficam parados, se o dono ficou). Quando ela desliga, a visão de todos volta. Funciona interceptando o `pfnSetView` da tabela do engine que o `hl.dll` recebe.
+- **Revive, respawn e checkpoints:**
+  - **Revive:** quando um aliado cai, o grupo pode revivê-lo com a seringa (`weapon_syringe`), que é o revive nativo do co-op. Ele levanta no lugar com 30 de vida e recebe de volta o que faltar do inventário.
+  - **Pular:** o jogador caído pode apertar pular para renascer ao lado de um companheiro vivo **com os seus itens**. O aviso do jogo diz "lose weapons", mas o mod devolve tudo.
+  - **Tempo limite:** se ninguém reviver, ele renasce assim mesmo depois de `cofmp_respawn_time` segundos (padrão 30).
+  - **Todos mortos:** o jogo reinicia o mapa e cada um recebe de volta o inventário da última foto, que a DLL tira a cada segundo.
+
+## Instalar
+**Jeito fácil:** rode `dist\CoF_Coop_Mod.exe` e escolha 1 (instalar), 2 (desinstalar) ou 3 (hospedar). Ele acha o jogo nas bibliotecas da Steam sozinho. Só o host precisa do mod; quem entra usa o jogo normal.
+
+Manual:
+1. Rode `build.bat`, que gera `build\cofmp.dll`.
+2. Copie a DLL para `Cry of Fear\cryoffear\cl_dlls\`.
+3. No `cryoffear\liblist.gam`, troque `gamedll "cl_dlls/hl.dll"` por `gamedll "cl_dlls/cofmp.dll"`. O original fica salvo em `liblist.gam.orig`.
+
+Para desinstalar, restaure o `liblist.gam.orig`. Verificar os arquivos na Steam também desfaz a troca.
+
+### Atualização automática
+Toda vez que abre, o `CoF_Coop_Mod.exe` consulta a última release do GitHub. Se a tag for mais nova que a versão dele, baixa os arquivos soltos da release para a própria pasta, troca os antigos e reabre já atualizado. Se o mod estava instalado, a DLL do jogo é trocada na hora (com o jogo fechado). Sem internet, ele segue com a versão que tem.
+
+## Publicar uma versão
+Precisa do Visual Studio 2022 Build Tools, do SDK do Half-Life em `..\deps\halflife` (`git clone https://github.com/ValveSoftware/halflife ..\deps\halflife`), do `pefile` (`py -m pip install pefile`), do jogo instalado e do `gh` logado.
+
+```
+release.bat 1.2 "o que mudou"
+```
+
+Ele grava a versão em `VERSION`, compila a DLL, o instalador e o túnel, monta `dist\CoF_Coop_Mod.zip`, faz commit e push e cria a release `v1.2` com o zip (para quem baixa a primeira vez) e os arquivos soltos (que o instalador usa para se atualizar).
+
+## Jogar
+O host abre um servidor com o mapa inicial da campanha, por exemplo:
+
+```
+cof.exe -game cryoffear -insecure +maxplayers 4 +map c_apartment1
+```
+
+Os outros jogadores abrem o Cry of Fear e digitam no console (tecla `'`) `connect <ip do host>`. Pela internet o host precisa liberar a porta UDP 27015 no roteador, ou os dois entram na mesma VPN (Radmin VPN, ZeroTier, Hamachi) e usam o IP dela.
+
+### Sem abrir porta: túnel pela Steam
+O `CoF_Tunel.exe` (com o `steam_api.dll` ao lado) leva o tráfego do jogo pela rede P2P da Steam. Ele se identifica como Spacewar (appid 480), então a Steam mostra "jogando Spacewar" enquanto ele está aberto. Não precisa de VPN nem de porta aberta.
+1. **Host:** no instalador, opção **3**. O jogo abre hospedando e o túnel abre junto, mostrando um código (já copiado) para mandar ao amigo.
+2. **Amigo:** no instalador, opção **4**. Ele cola o código, o túnel conecta e o jogo abre com `connect 127.0.0.1:27020`. Se não entrar, é só repetir esse comando no console.
+
+As duas janelas do túnel ficam abertas enquanto jogam. Também dá para rodar direto: `CoF_Tunel.exe host [porta do jogo]` ou `CoF_Tunel.exe join <código> [porta local]`.
+
+### Crashes
+Se o jogo crashar com o mod carregado (no PC de quem hospeda), o mod grava `cryoffear\cofmp_crash_<data>.dmp`. Mande esse arquivo para análise.
+
+## Cvars e comandos (servidor)
+| | |
+|---|---|
+| `cofmp_enable 1` | liga/desliga tudo |
+| `cofmp_exit_wait 1` | 1 = saída por toque espera o grupo; 0 = troca assim que alguém toca |
+| `cofmp_exit_timeout 0` | segundos até trocar mesmo sem todos (0 = espera sempre) |
+| `cofmp_exits` | lista as saídas do mapa atual |
+| `cofmp_tp_exit <#>` | leva todos os jogadores vivos para a saída `#` (destravar o grupo) |
+| `cofmp_keep_inventory 1` | 1 = leva o inventário de cada jogador para o próximo mapa |
+| `cofmp_share_items 1` | 1 = chaves/itens pegos por um jogador vão para todos |
+| `cofmp_model simon` | modelo forçado em todos os jogadores (vazio = deixa o do jogo) |
+| `cofmp_respawn_time 30` | segundos até o jogador caído renascer sozinho perto do grupo, se ninguém reviver (0 = só por revive ou pulando) |
+| `cofmp_debug` | estado dos slots de jogador |
+| `cofmp_inv` | chaveiro do grupo, armas, munição e slots de inventário de cada jogador |
+| `cofmp_bot [nome]` | cria um bot parado (testes com 1 pessoa só) |
+| `cofmp_use <classe> x y z [slot]` | o jogador do slot (padrão: o primeiro humano) usa a entidade dessa classe mais perto do ponto (testes) |
+| `cofmp_after <seg> <comando>` | roda o comando depois de alguns segundos (roteiros de teste). Com `-cofmp_test <cfg>` na linha de comando, o cfg roda no primeiro mapa da campanha |
+| `cofmp_kill <n>` / `cofmp_revive <n>` | derruba / revive (pelo revive nativo) o jogador do slot n (testes) |
+| `cofmp_tp x y z` | leva o primeiro jogador para o ponto livre mais próximo (testes) |
+| `cofmp_give <classe>` | dá um item a todos os jogadores vivos (testes) |
+| `cofmp_select <classe>` | põe a arma na mão de todos os jogadores vivos (testes) |
+
+## Notas de engenharia reversa
+- O detour é aplicado em `CChangeLevel::ChangeLevelNow`, no RVA 0x109d40 do `hl.dll`. Antes de aplicar, a DLL confere a assinatura dos bytes; se o `hl.dll` mudar, o detour é desativado e um aviso aparece no console.
+- Inventário: `CBasePlayer::GiveNamedItem` fica no RVA 0xe0a80 e `SelectLastItem` no RVA 0xf1c20. Os dois são conferidos por assinatura. Os offsets dos campos vieram das tabelas de save/restore: `m_rgpPlayerItems` 0x2514, `m_rgAmmo` 0x2540, `inventorySlot` 0x21fc e `m_iClip` 0x1e4.
+- O cliente do CoF não repassa o comando `weapon_x`. Por isso a troca de arma é feita apontando `m_pLastItem` para a arma desejada e chamando `SelectLastItem`, que é o `lastinv` do jogo.
+- Itens de inventário (`inventorySlot`, strings como `inventoryitems/apartmentkey.txt`): `AddToInventory` fica no RVA 0xdad40 (`thiscall(player, arquivo, modelo, classe)`; não duplica item) e `RemoveInventoryItem` no RVA 0xdda70 (`thiscall(player, arquivo, bool todos)`). A DLL compara os slots de cada jogador a cada 0,2 s: item novo entra no chaveiro do grupo e é dado a todos; item do chaveiro que sumiu foi gasto e é removido de todos.
+- Abrir porta trancada: o cliente manda `inventoryuse <slot>`, que chama `CBasePlayer::UseInventoryItem` (0x100e4410). Ele procura um `inter_door` a até 64 unidades cujo `lockedby` (+0x18c) seja o nome do item, destranca e tira o item do slot. O "use" normal da porta só mostra a mensagem de trancada.
+- O `entvars_t` do CoF tem 4 bytes extras depois de `light_level`, então `health` fica em 0x164. O layout corrigido está em `sdk_cof/progdefs.h`. Os offsets vieram de `gEntvarsDescription` no `hl.dll`.
+- Portas de transição: `CInterDoor::Use` fica no RVA 0x48f70 (slot 58 da vtable). Ela escurece a tela de quem abriu e, 2 s depois, o think (0x48070) teleporta só esse jogador para o `inter_door_exit` do `target`. Nos mapas, essa sala de saída tem um `trigger_multiple` que dispara o `trigger_changelevel`, com quem passou como ativador.
+- Bots (`FL_FAKECLIENT`) não têm canal de rede. Na troca de mapa o engine os derruba, e um `SetView` neles dá "SZ_GetSpace: Tried to write to an uninitialized sizebuf_t". Por isso a câmera de cutscene não é compartilhada com bots nem durante a troca.
+- Revive nativo: `CBasePlayer::StartRevive` (RVA 0xf1860, `thiscall`, sem argumentos). Ele é chamado pela seringa quando ela acerta um jogador morto e o modo é co-op. Também é chamado quando alguém segura USE perto do corpo. A função põe `pev->fuser3 = 3`, e o think de morte (0x100e9ab0) levanta o jogador com 30 de vida quando o tempo acaba.

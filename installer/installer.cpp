@@ -1,0 +1,688 @@
+// Instalador do cofmp (campanha do Cry of Fear em co-op).
+// Leva o cofmp.dll embutido como recurso (RCDATA 1). Acha a instalacao do jogo pelas bibliotecas
+// da Steam, copia a DLL para cryoffear\cl_dlls e troca o gamedll do liblist.gam (com backup).
+// Ao abrir, se atualiza sozinho pela ultima release do GitHub (ver Update).
+
+#include <windows.h>
+#include <shellapi.h>
+#include <tlhelp32.h>
+#include <winhttp.h>
+#include <stdio.h>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <math.h>
+
+// le uma linha sem BOM, \r e espacos nas pontas (entrada redirecionada vem com \r\n)
+static bool ReadLine(std::string& out)
+{
+	if (!std::getline(std::cin, out))
+		return false;
+	if (out.compare(0, 3, "\xEF\xBB\xBF") == 0)
+		out.erase(0, 3);
+	size_t a = out.find_first_not_of(" \t\r"), b = out.find_last_not_of(" \t\r");
+	out = a == std::string::npos ? "" : out.substr(a, b - a + 1);
+	return true;
+}
+
+static const char* REL_GAME = "\\steamapps\\common\\Cry of Fear";
+
+static bool Exists(const std::string& p)
+{
+	return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool ReadFile(const std::string& p, std::string& out)
+{
+	std::ifstream f(p, std::ios::binary);
+	if (!f)
+		return false;
+	std::stringstream ss;
+	ss << f.rdbuf();
+	out = ss.str();
+	return true;
+}
+
+static bool WriteFile(const std::string& p, const std::string& data)
+{
+	std::ofstream f(p, std::ios::binary | std::ios::trunc);
+	if (!f)
+		return false;
+	f << data;
+	return (bool)f;
+}
+
+static std::string RegString(HKEY root, const char* key, const char* value)
+{
+	char buf[MAX_PATH] = {};
+	DWORD size = sizeof(buf);
+	if (RegGetValueA(root, key, value, RRF_RT_REG_SZ, NULL, buf, &size) != ERROR_SUCCESS)
+		return "";
+	std::string s = buf;
+	for (char& c : s)
+		if (c == '/')
+			c = '\\';
+	return s;
+}
+
+// instalacao completa = tem o hl.dll e o liblist.gam (copias parciais em outras bibliotecas nao servem)
+static bool IsGameDir(const std::string& dir)
+{
+	return Exists(dir + "\\cof.exe") && Exists(dir + "\\cryoffear\\liblist.gam") &&
+		Exists(dir + "\\cryoffear\\cl_dlls\\hl.dll");
+}
+
+static std::string FindGame()
+{
+	std::vector<std::string> libs;
+	std::string steam = RegString(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath");
+	if (steam.empty())
+		steam = RegString(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam", "InstallPath");
+	if (!steam.empty())
+	{
+		libs.push_back(steam);
+		std::string vdf;
+		if (ReadFile(steam + "\\steamapps\\libraryfolders.vdf", vdf))
+		{
+			// linhas do tipo:  "path"		"E:\\SteamLibrary"
+			size_t at = 0;
+			while ((at = vdf.find("\"path\"", at)) != std::string::npos)
+			{
+				size_t a = vdf.find('"', at + 6);
+				size_t b = a == std::string::npos ? a : vdf.find('"', a + 1);
+				if (b == std::string::npos)
+					break;
+				std::string p = vdf.substr(a + 1, b - a - 1), clean;
+				for (size_t k = 0; k < p.size(); k++)
+				{
+					clean += p[k];
+					if (p[k] == '\\' && k + 1 < p.size() && p[k + 1] == '\\')
+						k++;
+				}
+				libs.push_back(clean);
+				at = b;
+			}
+		}
+	}
+	libs.push_back("C:\\Program Files (x86)\\Steam");
+	for (const std::string& lib : libs)
+		if (IsGameDir(lib + REL_GAME))
+			return lib + REL_GAME;
+	return "";
+}
+
+static bool ExtractDll(const std::string& dest)
+{
+	HRSRC r = FindResourceA(NULL, MAKEINTRESOURCEA(1), (LPCSTR)RT_RCDATA);
+	HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
+	if (!g)
+		return false;
+	std::string data((const char*)LockResource(g), SizeofResource(NULL, r));
+	return WriteFile(dest, data);
+}
+
+static bool SetGameDll(const std::string& liblist, const char* from, const char* to)
+{
+	std::string s;
+	if (!ReadFile(liblist, s))
+		return false;
+	size_t at = s.find(from);
+	if (at == std::string::npos)
+		return s.find(to) != std::string::npos; // ja esta como queremos
+	s.replace(at, strlen(from), to);
+	return WriteFile(liblist, s);
+}
+
+// ---------------------------------------------------------------- modelo do Simon
+//
+// O co-op do CoF so tem modelos de policial com as animacoes de jogador. O Simon (models/cutscene/
+// player.mdl) usa o mesmo esqueleto Bip01, com a mesma pose de referencia, mais 4 ossos de ponta
+// (Toe01, Finger12). Montamos models/player/simon/simon.mdl a partir dos arquivos do proprio jogo:
+// o police1.mdl inteiro (ossos, sequencias, hitboxes) + o Simon anexado no fim, com o cabecalho
+// apontando para as texturas e a malha do Simon. Os vertices dos ossos extras vao para o osso pai.
+
+static int I32(const std::string& b, size_t o)
+{
+	int v;
+	memcpy(&v, b.data() + o, 4);
+	return v;
+}
+
+static void SetI32(std::string& b, size_t o, int v)
+{
+	memcpy(&b[o], &v, 4);
+}
+
+struct MdlBone
+{
+	std::string name;
+	int parent;
+	float value[6];
+};
+
+static std::vector<MdlBone> MdlBones(const std::string& b)
+{
+	std::vector<MdlBone> out;
+	int n = I32(b, 140), ix = I32(b, 144);
+	for (int k = 0; k < n; k++)
+	{
+		size_t o = ix + k * 112;
+		MdlBone bone;
+		bone.name = std::string(b.c_str() + o);
+		bone.parent = I32(b, o + 32);
+		memcpy(bone.value, b.data() + o + 64, sizeof(bone.value));
+		out.push_back(bone);
+	}
+	return out;
+}
+
+static bool BuildSimonModel(const std::string& game)
+{
+	std::string models = game + "\\cryoffear\\models\\", pol, sim;
+	if (!ReadFile(models + "player\\police1\\police1.mdl", pol) || !ReadFile(models + "cutscene\\player.mdl", sim) ||
+		pol.size() < 244 || sim.size() < 244 || pol.compare(0, 4, "IDST") || sim.compare(0, 4, "IDST"))
+		return false;
+
+	std::vector<MdlBone> pb = MdlBones(pol), sb = MdlBones(sim);
+	std::vector<int> remap(sb.size());
+	std::vector<bool> extra(sb.size());
+	std::vector<std::vector<float>> xf(sb.size()); // matriz 3x3 + translacao (osso extra -> pai)
+	for (size_t k = 0; k < sb.size(); k++)
+	{
+		auto find = [&](const std::string& n) {
+			for (size_t j = 0; j < pb.size(); j++)
+				if (pb[j].name == n)
+					return (int)j;
+			return -1;
+		};
+		int j = find(sb[k].name);
+		if (j >= 0)
+		{
+			for (int c = 0; c < 6; c++)
+				if (fabsf(sb[k].value[c] - pb[j].value[c]) > 1e-3f)
+					return false; // esqueleto diferente: nao da para trocar so a malha
+			remap[k] = j;
+			continue;
+		}
+		if (sb[k].parent < 0 || (j = find(sb[sb[k].parent].name)) < 0)
+			return false;
+		remap[k] = j;
+		extra[k] = true;
+		const float* v = sb[k].value;
+		float cx = cosf(v[3]), sx = sinf(v[3]), cy = cosf(v[4]), sy = sinf(v[4]), cz = cosf(v[5]), sz = sinf(v[5]);
+		xf[k] = { cy * cz, sx * sy * cz - cx * sz, cx * sy * cz + sx * sz,
+				  cy * sz, sx * sy * sz + cx * cz, cx * sy * sz - sx * cz,
+				  -sy, sx * cy, cx * cy,
+				  v[0], v[1], v[2] };
+	}
+
+	const int B = (int)pol.size();
+	std::string out = pol + sim;
+	auto fix = [&](size_t o) { SetI32(out, o, I32(out, o) + B); };
+	auto move = [&](size_t at, int bone, bool point) {
+		float p[3], q[3];
+		memcpy(p, out.data() + at, sizeof(p));
+		const std::vector<float>& m = xf[bone];
+		for (int r = 0; r < 3; r++)
+			q[r] = m[r * 3] * p[0] + m[r * 3 + 1] * p[1] + m[r * 3 + 2] * p[2] + (point ? m[9 + r] : 0);
+		memcpy(&out[at], q, sizeof(q));
+	};
+
+	int ntex = I32(sim, 180), tix = I32(sim, 184);
+	for (int t = 0; t < ntex; t++)
+		fix(B + tix + t * 80 + 76);
+	int nbp = I32(sim, 204), bpix = I32(sim, 208);
+	for (int bp = 0; bp < nbp; bp++)
+	{
+		size_t o = B + bpix + bp * 76;
+		int nmodels = I32(out, o + 64);
+		fix(o + 72);
+		for (int m = 0; m < nmodels; m++)
+		{
+			size_t mo = I32(out, o + 72) + m * 112;
+			int nmesh = I32(out, mo + 72), nverts = I32(out, mo + 80), nnorms = I32(out, mo + 92);
+			for (int f : { 76, 84, 88, 96, 100 })
+				fix(mo + f);
+			size_t vinfo = I32(out, mo + 84), verts = I32(out, mo + 88), ninfo = I32(out, mo + 96),
+				   norms = I32(out, mo + 100);
+			for (int v = 0; v < nverts; v++)
+			{
+				int bone = (unsigned char)out[vinfo + v];
+				if (bone >= (int)sb.size())
+					return false;
+				if (extra[bone])
+					move(verts + v * 12, bone, true);
+				out[vinfo + v] = (char)remap[bone];
+			}
+			for (int v = 0; v < nnorms; v++)
+			{
+				int bone = (unsigned char)out[ninfo + v];
+				if (bone >= (int)sb.size())
+					return false;
+				if (extra[bone])
+					move(norms + v * 12, bone, false);
+				out[ninfo + v] = (char)remap[bone];
+			}
+			for (int me = 0; me < nmesh; me++)
+			{
+				size_t meo = I32(out, mo + 76) + me * 20;
+				fix(meo + 4);
+				fix(meo + 16);
+			}
+		}
+	}
+
+	// cabecalho: texturas, skins e corpo do Simon; o resto (ossos, sequencias...) do policial
+	for (int f : { 184, 188, 200, 208 })
+		SetI32(out, f, I32(sim, f) + B);
+	for (int f : { 180, 192, 196, 204 })
+		SetI32(out, f, I32(sim, f));
+	memset(&out[8], 0, 64);
+	memcpy(&out[8], "simon.mdl", 9);
+	SetI32(out, 72, (int)out.size());
+
+	CreateDirectoryA((models + "player\\simon").c_str(), NULL);
+	return WriteFile(models + "player\\simon\\simon.mdl", out);
+}
+
+static void InstallSimon(const std::string& game)
+{
+	if (BuildSimonModel(game))
+		printf("  Modelo do Simon pronto (models\\player\\simon\\simon.mdl).\n");
+	else
+		printf("  Aviso: nao consegui montar o modelo do Simon; os jogadores vao aparecer de policial.\n");
+}
+
+static const char* GAMEDLL_ORIG = "gamedll \"cl_dlls/hl.dll\"";
+static const char* GAMEDLL_MOD = "gamedll \"cl_dlls/cofmp.dll\"";
+
+static bool GameRunning()
+{
+	// pelo processo: uma janela do Explorer com o nome da pasta "Cry of Fear" tambem bateria pelo titulo
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	PROCESSENTRY32 pe = { sizeof(pe) };
+	bool found = false;
+	for (BOOL ok = Process32First(snap, &pe); ok && !found; ok = Process32Next(snap, &pe))
+		found = !_stricmp(pe.szExeFile, "cof.exe");
+	CloseHandle(snap);
+	return found;
+}
+
+static void Install(const std::string& game)
+{
+	std::string cry = game + "\\cryoffear";
+	if (GameRunning())
+	{
+		printf("\n  Feche o Cry of Fear antes de instalar.\n");
+		return;
+	}
+	if (!ExtractDll(cry + "\\cl_dlls\\cofmp.dll"))
+	{
+		printf("\n  ERRO: nao consegui copiar o cofmp.dll para %s\\cl_dlls.\n", cry.c_str());
+		return;
+	}
+	std::string lib = cry + "\\liblist.gam";
+	if (!Exists(lib + ".orig"))
+		CopyFileA(lib.c_str(), (lib + ".orig").c_str(), TRUE);
+	if (!SetGameDll(lib, GAMEDLL_ORIG, GAMEDLL_MOD))
+	{
+		printf("\n  ERRO: nao consegui ajustar o liblist.gam.\n");
+		return;
+	}
+	printf("\n  Mod instalado! (backup do original em liblist.gam.orig)\n");
+	InstallSimon(game);
+}
+
+static void Uninstall(const std::string& game)
+{
+	std::string cry = game + "\\cryoffear";
+	if (GameRunning())
+	{
+		printf("\n  Feche o Cry of Fear antes de desinstalar.\n");
+		return;
+	}
+	if (!SetGameDll(cry + "\\liblist.gam", GAMEDLL_MOD, GAMEDLL_ORIG))
+	{
+		printf("\n  ERRO: nao consegui ajustar o liblist.gam.\n");
+		return;
+	}
+	DeleteFileA((cry + "\\cl_dlls\\cofmp.dll").c_str());
+	DeleteFileA((cry + "\\models\\player\\simon\\simon.mdl").c_str());
+	RemoveDirectoryA((cry + "\\models\\player\\simon").c_str());
+	printf("\n  Mod removido. O jogo voltou ao normal.\n");
+}
+
+// o tunel (CoF_Tunel.exe + steam_api.dll) fica na mesma pasta do instalador
+static bool StartTunnel(const std::string& args)
+{
+	char dir[MAX_PATH];
+	GetModuleFileNameA(NULL, dir, MAX_PATH);
+	*strrchr(dir, '\\') = 0;
+	std::string exe = std::string(dir) + "\\CoF_Tunel.exe";
+	if (!Exists(exe))
+		return false;
+	return (INT_PTR)ShellExecuteA(NULL, "open", exe.c_str(), args.c_str(), dir, SW_SHOWNORMAL) > 32;
+}
+
+static void Host(const std::string& game)
+{
+	std::string lib;
+	ReadFile(game + "\\cryoffear\\liblist.gam", lib);
+	if (lib.find(GAMEDLL_MOD) == std::string::npos)
+	{
+		printf("\n  Instale o mod primeiro (opcao 1).\n");
+		return;
+	}
+	std::string n, map;
+	printf("\n  Quantos jogadores (2-4) [4]: ");
+	ReadLine(n);
+	if (n.empty() || n.find_first_not_of("0123456789") != std::string::npos)
+		n = "4";
+	printf("  Mapa inicial [c_apartment1]: ");
+	ReadLine(map);
+	if (map.empty() || map.find_first_of(" \"&|;") != std::string::npos)
+		map = "c_apartment1";
+	std::string args = "-game cryoffear -insecure +sv_lan 0 +maxplayers " + n + " +map " + map;
+	ShellExecuteA(NULL, "open", (game + "\\cof.exe").c_str(), args.c_str(), game.c_str(), SW_SHOWNORMAL);
+	if (StartTunnel("host"))
+		printf("\n  Abrindo o servidor e o tunel da Steam. Mande para o seu amigo o codigo que aparece no tunel.\n");
+	else
+		printf("\n  Abrindo o servidor... Seu amigo entra pelo console (tecla ') com:  connect SEU_IP\n");
+}
+
+static void Join(const std::string& game)
+{
+	printf("\n  Cole o codigo que o host te passou: ");
+	std::string code;
+	ReadLine(code);
+	if (code.empty() || code.find_first_not_of("0123456789") != std::string::npos)
+	{
+		printf("\n  Codigo invalido.\n");
+		return;
+	}
+	InstallSimon(game); // o modelo dos outros jogadores e lido do PC de quem esta vendo
+	if (!StartTunnel("join " + code))
+	{
+		printf("\n  Nao achei o CoF_Tunel.exe na pasta do instalador.\n");
+		return;
+	}
+	Sleep(3000); // da tempo da Steam montar a conexao antes do jogo tentar conectar
+	ShellExecuteA(NULL, "open", (game + "\\cof.exe").c_str(), "-game cryoffear +connect 127.0.0.1:27020",
+		game.c_str(), SW_SHOWNORMAL);
+	printf("\n  Abrindo o jogo conectado ao host. Se ele nao entrar, digite no console:  connect 127.0.0.1:27020\n");
+}
+
+// ---------------------------------------------------------------- atualizacao automatica
+//
+// Consulta a ultima release do REPO. Se a tag (v1.2) for mais nova que COFMP_VERSION, baixa os arquivos
+// soltos da release (o .zip e so para quem baixa pela primeira vez) para a pasta do instalador como .new.
+// Com tudo baixado, renomeia os atuais para .old (o Windows deixa renomear exe/dll abertos), poe os novos
+// no lugar e roda o instalador novo nesta mesma janela. A DLL do jogo e trocada por SyncDll.
+
+#ifndef COFMP_VERSION
+#define COFMP_VERSION "0"
+#endif
+
+static const char* REPO = "CrawlerD/cofmp";
+
+static bool HttpGet(const std::string& url, std::string& out)
+{
+	std::wstring w(url.begin(), url.end());
+	wchar_t host[256], path[2048];
+	URL_COMPONENTS uc = { sizeof(uc) };
+	uc.lpszHostName = host;
+	uc.dwHostNameLength = _countof(host);
+	uc.lpszUrlPath = path;
+	uc.dwUrlPathLength = _countof(path);
+	if (!WinHttpCrackUrl(w.c_str(), 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS)
+		return false;
+	HINTERNET s = WinHttpOpen(L"cofmp-updater", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+		WINHTTP_NO_PROXY_BYPASS, 0);
+	HINTERNET c = s ? WinHttpConnect(s, host, uc.nPort, 0) : NULL;
+	HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+		WINHTTP_FLAG_SECURE) : NULL;
+	bool ok = false;
+	if (r)
+	{
+		WinHttpSetTimeouts(s, 5000, 5000, 10000, 30000);
+		DWORD status = 0, size = sizeof(status);
+		if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+			WinHttpReceiveResponse(r, NULL) &&
+			WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &size, NULL) &&
+			status == 200)
+		{
+			out.clear();
+			char buf[16384];
+			DWORD got;
+			while ((ok = WinHttpReadData(r, buf, sizeof(buf), &got) != FALSE) && got)
+				out.append(buf, got);
+		}
+	}
+	if (r)
+		WinHttpCloseHandle(r);
+	if (c)
+		WinHttpCloseHandle(c);
+	if (s)
+		WinHttpCloseHandle(s);
+	return ok;
+}
+
+// todos os valores string de uma chave do JSON, na ordem (o da API do GitHub nao tem aspas escapadas nesses campos)
+static std::vector<std::string> JsonStrings(const std::string& json, const std::string& key)
+{
+	std::vector<std::string> out;
+	std::string k = "\"" + key + "\"";
+	for (size_t at = 0; (at = json.find(k, at)) != std::string::npos;)
+	{
+		size_t a = json.find_first_not_of(" \t\r\n:", at + k.size());
+		size_t b = a == std::string::npos || json[a] != '"' ? std::string::npos : json.find('"', a + 1);
+		if (b == std::string::npos)
+			break;
+		out.push_back(json.substr(a + 1, b - a - 1));
+		at = b;
+	}
+	return out;
+}
+
+// "v1.10.2" > "1.9"
+static bool NewerVersion(const std::string& tag, const std::string& cur)
+{
+	auto parse = [](const std::string& s) {
+		std::vector<int> v;
+		size_t at = s.find_first_of("0123456789");
+		while (at != std::string::npos && at < s.size() && isdigit((unsigned char)s[at]))
+		{
+			v.push_back(atoi(s.c_str() + at));
+			at = s.find_first_not_of("0123456789", at);
+			if (at == std::string::npos || s[at] != '.')
+				break;
+			at++;
+		}
+		return v;
+	};
+	std::vector<int> a = parse(tag), b = parse(cur);
+	if (a.empty())
+		return false;
+	for (size_t k = 0; k < a.size() || k < b.size(); k++)
+	{
+		int x = k < a.size() ? a[k] : 0, y = k < b.size() ? b[k] : 0;
+		if (x != y)
+			return x > y;
+	}
+	return false;
+}
+
+static std::string ExeDir()
+{
+	char dir[MAX_PATH];
+	GetModuleFileNameA(NULL, dir, MAX_PATH);
+	*strrchr(dir, '\\') = 0;
+	return dir;
+}
+
+static void DeleteOld(const std::string& dir)
+{
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA((dir + "\\*.old").c_str(), &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do
+		DeleteFileA((dir + "\\" + fd.cFileName).c_str()); // o exe antigo ainda aberto fica para a proxima vez
+	while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+// true = atualizou e o instalador novo ja rodou; o main so precisa sair com o codigo em exitCode
+static bool Update(int& exitCode)
+{
+	std::string dir = ExeDir();
+	DeleteOld(dir);
+
+	std::string json;
+	if (!HttpGet(std::string("https://api.github.com/repos/") + REPO + "/releases/latest", json))
+		return false; // sem internet ou sem release: segue com esta versao
+	std::vector<std::string> tag = JsonStrings(json, "tag_name");
+	if (tag.empty() || !NewerVersion(tag[0], COFMP_VERSION))
+		return false;
+
+	std::string prefix = std::string("https://github.com/") + REPO + "/releases/download/" + tag[0] + "/";
+	std::vector<std::string> names;
+	for (const std::string& url : JsonStrings(json, "browser_download_url"))
+	{
+		if (url.compare(0, prefix.size(), prefix))
+			continue;
+		std::string name = url.substr(prefix.size());
+		std::string ext = name.size() > 4 ? name.substr(name.size() - 4) : "";
+		if (name.empty() || name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") !=
+				std::string::npos || name[0] == '.' || !_stricmp(ext.c_str(), ".zip") || !_stricmp(ext.c_str(), ".rar"))
+			continue;
+		names.push_back(name);
+	}
+	bool hasExe = false;
+	for (const std::string& n : names)
+		hasExe |= !_stricmp(n.c_str(), "CoF_Coop_Mod.exe");
+	if (!hasExe)
+		return false;
+
+	printf("\n  Nova versao %s disponivel (esta e a %s). Baixando...\n", tag[0].c_str(), COFMP_VERSION);
+	for (const std::string& n : names)
+	{
+		std::string data;
+		if (!HttpGet(prefix + n, data) || data.empty() || !WriteFile(dir + "\\" + n + ".new", data))
+		{
+			printf("  Nao consegui baixar %s. Continuando com a versao atual.\n", n.c_str());
+			for (const std::string& m : names)
+				DeleteFileA((dir + "\\" + m + ".new").c_str());
+			return false;
+		}
+	}
+	for (const std::string& n : names)
+	{
+		std::string p = dir + "\\" + n;
+		DeleteFileA((p + ".old").c_str());
+		if (Exists(p) && !MoveFileA(p.c_str(), (p + ".old").c_str()))
+		{
+			printf("  Nao consegui substituir %s (feche o tunel e abra de novo).\n", n.c_str());
+			DeleteFileA((p + ".new").c_str());
+			continue;
+		}
+		MoveFileA((p + ".new").c_str(), p.c_str());
+	}
+	printf("  Atualizado para a %s!\n", tag[0].c_str());
+
+	// o novo roda nesta janela; esperamos ele terminar para o console nao voltar para o cmd no meio
+	std::string exe = dir + "\\CoF_Coop_Mod.exe", cmd = "\"" + exe + "\" --atualizado";
+	STARTUPINFOA si = { sizeof(si) };
+	PROCESS_INFORMATION pi;
+	if (!CreateProcessA(exe.c_str(), &cmd[0], NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi))
+	{
+		printf("  Feche e abra o CoF_Coop_Mod.exe de novo.\n\n  Aperte Enter para sair.");
+		std::string line;
+		ReadLine(line);
+		exitCode = 0;
+		return true;
+	}
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	DWORD code = 0;
+	GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+	exitCode = (int)code;
+	return true;
+}
+
+// com o mod instalado, troca a DLL do jogo se ela for diferente da que vem neste instalador (versao nova)
+static void SyncDll(const std::string& game)
+{
+	std::string cry = game + "\\cryoffear", lib, cur;
+	ReadFile(cry + "\\liblist.gam", lib);
+	if (lib.find(GAMEDLL_MOD) == std::string::npos)
+		return;
+	HRSRC r = FindResourceA(NULL, MAKEINTRESOURCEA(1), (LPCSTR)RT_RCDATA);
+	HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
+	if (!g || (ReadFile(cry + "\\cl_dlls\\cofmp.dll", cur) &&
+				  cur == std::string((const char*)LockResource(g), SizeofResource(NULL, r))))
+		return;
+	printf("\n  O mod instalado no jogo e de outra versao. Atualizando...");
+	Install(game);
+}
+
+int main(int argc, char** argv)
+{
+	SetConsoleOutputCP(CP_UTF8);
+	printf("==============================================\n");
+	printf("  Cry of Fear - campanha em co-op (cofmp) v%s\n", COFMP_VERSION);
+	printf("==============================================\n");
+
+	// o instalador que acabou de ser baixado nao procura de novo (tag e versao desencontradas dariam laco)
+	int exitCode;
+	if ((argc < 2 || strcmp(argv[1], "--atualizado")) && Update(exitCode))
+		return exitCode;
+
+	std::string game = FindGame();
+	if (game.empty())
+	{
+		printf("\n  Nao achei o Cry of Fear nas bibliotecas da Steam.\n");
+		printf("  Cole a pasta do jogo (a que tem o cof.exe): ");
+		ReadLine(game);
+		while (!game.empty() && (game.back() == '"' || game.back() == '\\' || game.back() == ' '))
+			game.pop_back();
+		if (!game.empty() && game.front() == '"')
+			game.erase(0, 1);
+		if (!IsGameDir(game))
+		{
+			printf("\n  Essa pasta nao tem o Cry of Fear completo.\n\n  Aperte Enter para sair.");
+			ReadLine(game);
+			return 1;
+		}
+	}
+	printf("\n  Jogo encontrado em: %s\n", game.c_str());
+	SyncDll(game);
+
+	for (;;)
+	{
+		std::string lib;
+		ReadFile(game + "\\cryoffear\\liblist.gam", lib);
+		bool installed = lib.find(GAMEDLL_MOD) != std::string::npos;
+		printf("\n  Estado: %s\n", installed ? "MOD INSTALADO" : "mod nao instalado");
+		printf("\n  1) Instalar / atualizar o mod\n");
+		printf("  2) Desinstalar o mod\n");
+		printf("  3) Hospedar a campanha co-op agora\n");
+		printf("  4) Entrar no jogo de um amigo (tunel Steam)\n");
+		printf("  0) Sair\n\n  Escolha: ");
+		std::string opt;
+		if (!ReadLine(opt) || opt == "0")
+			break;
+		if (opt == "1")
+			Install(game);
+		else if (opt == "2")
+			Uninstall(game);
+		else if (opt == "3")
+			Host(game);
+		else if (opt == "4")
+			Join(game);
+	}
+	return 0;
+}

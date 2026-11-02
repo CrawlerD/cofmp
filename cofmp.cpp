@@ -2179,7 +2179,10 @@ static void ResetGod()
 static const int OBS_IN_EYE = 4;
 static bool g_adminGod[33], g_noclip[33], g_infAmmo[33], g_infStamina[33];
 static std::unordered_map<void*, int> g_ammoMax; // municao infinita: o maior pente visto em cada arma
-static const int OFS_STAMINA = 0x21f0; // float, 0..100
+// CBasePlayer, da tabela de save/restore do hl.dll (achado pelo Riique no PR #1): com m_bInfiniteStamina ligado o
+// PreThink nao gasta estamina ao correr; m_fStamina (0..100) e o que vai para a barra no user message "Stamina"
+static const int OFS_INF_STAMINA = 0x21e8; // bool m_bInfiniteStamina
+static const int OFS_STAMINA = 0x21f0;     // float m_fStamina
 static struct
 {
 	int target; // 0 = nao esta espectando
@@ -2313,6 +2316,8 @@ static void AdminCommand(int i, edict_t* p)
 	{
 		bool ammo = !_stricmp(what, "ammo");
 		(ammo ? g_infAmmo : g_infStamina)[i] = n != 0;
+		if (!ammo && !n) // desliga uma vez so: um mapa pode ligar a flag por conta propria
+			Field<unsigned char>(p->pvPrivateData, OFS_INF_STAMINA) = 0;
 		g_eng->pfnClientPrintf(p, print_center, ammo ? (n ? "Municao infinita ligada" : "Municao infinita desligada")
 			: (n ? "Estamina infinita ligada" : "Estamina infinita desligada"));
 		Log("jogador %d: %s infinita %s", i, ammo ? "municao" : "estamina", n ? "ligada" : "desligada");
@@ -2365,8 +2370,12 @@ static void AdminThink()
 		if (g_adminGod[i] && !(g_god[i].why & GOD_ADMIN))
 			SetGod(i, GOD_ADMIN, true);
 		void* pl = p->pvPrivateData;
-		if (g_infStamina[i] && Field<float>(pl, OFS_STAMINA) < 100)
-			Field<float>(pl, OFS_STAMINA) = 100;
+		if (g_infStamina[i]) // reforca todo frame: renascer e trocar de mapa recriam o jogador
+		{
+			Field<unsigned char>(pl, OFS_INF_STAMINA) = 1;
+			if (Field<float>(pl, OFS_STAMINA) < 100)
+				Field<float>(pl, OFS_STAMINA) = 100;
+		}
 		void* it = Field<void*>(pl, OFS_ACTIVE_ITEM);
 		if (g_infAmmo[i] && it && PevOf(it))
 		{

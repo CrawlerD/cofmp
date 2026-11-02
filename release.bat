@@ -17,7 +17,7 @@ call "%HERE%installer\build_installer.bat" || exit /b 1
 call "%HERE%tunnel\build_tunnel.bat" || exit /b 1
 
 set D=%HERE%dist
-set FILES=CoF_Coop_Mod.exe CoF_Tunel.exe steam_api.dll steam_appid.txt COMO_JOGAR.txt
+set FILES=CoF_Coop_Mod.exe CoF_Tunel.exe steam_api.dll steam_appid.txt COMO_JOGAR.txt ATUALIZAR.bat
 del "%D%\CoF_Coop_Mod.zip" 2>nul
 tar -a -c -f "%D%\CoF_Coop_Mod.zip" -C "%D%" %FILES% || exit /b 1
 

@@ -36,6 +36,8 @@ Para desinstalar, restaure o `liblist.gam.orig`. Verificar os arquivos na Steam 
 ### Atualização automática
 Toda vez que abre, o `CoF_Coop_Mod.exe` consulta a última release do GitHub. Se a tag for mais nova que a versão dele, baixa os arquivos soltos da release para a própria pasta, troca os antigos e reabre já atualizado. Se o mod estava instalado, a DLL do jogo é trocada na hora (com o jogo fechado). Sem internet, ele segue com a versão que tem.
 
+O `ATUALIZAR.bat`, que fica na mesma pasta, faz só isso sem abrir o menu: roda `CoF_Coop_Mod.exe --atualizar`. Esse comando atualiza o instalador e o túnel, troca a DLL do jogo (ou instala o mod, se ele não estiver instalado) e sai. O instalador não troca o próprio `.bat` na atualização, porque o `cmd` lê o arquivo aos poucos enquanto ele roda.
+
 ## Publicar uma versão
 Precisa do Visual Studio 2022 Build Tools, do SDK do Half-Life em `..\deps\halflife` (`git clone https://github.com/ValveSoftware/halflife ..\deps\halflife`), do `pefile` (`py -m pip install pefile`), do jogo instalado e do `gh` logado.
 

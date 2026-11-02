@@ -556,6 +556,8 @@ static void DeleteOld(const std::string& dir)
 }
 
 // true = atualizou e o instalador novo ja rodou; o main so precisa sair com o codigo em exitCode
+static bool g_onlyUpdate; // --atualizar (ATUALIZAR.bat): atualiza o instalador e o mod do jogo e sai
+
 static bool Update(int& exitCode)
 {
 	std::string dir = ExeDir();
@@ -577,7 +579,8 @@ static bool Update(int& exitCode)
 		std::string name = url.substr(prefix.size());
 		std::string ext = name.size() > 4 ? name.substr(name.size() - 4) : "";
 		if (name.empty() || name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") !=
-				std::string::npos || name[0] == '.' || !_stricmp(ext.c_str(), ".zip") || !_stricmp(ext.c_str(), ".rar"))
+				std::string::npos || name[0] == '.' || !_stricmp(ext.c_str(), ".zip") || !_stricmp(ext.c_str(), ".rar") ||
+			!_stricmp(ext.c_str(), ".bat")) // o cmd le o .bat aos poucos: trocar o que esta rodando quebra ele
 			continue;
 		names.push_back(name);
 	}
@@ -614,7 +617,7 @@ static bool Update(int& exitCode)
 	printf("  Atualizado para a %s!\n", tag[0].c_str());
 
 	// o novo roda nesta janela; esperamos ele terminar para o console nao voltar para o cmd no meio
-	std::string exe = dir + "\\CoF_Coop_Mod.exe", cmd = "\"" + exe + "\" --atualizado";
+	std::string exe = dir + "\\CoF_Coop_Mod.exe", cmd = "\"" + exe + "\" --atualizado" + (g_onlyUpdate ? " --atualizar" : "");
 	STARTUPINFOA si = { sizeof(si) };
 	PROCESS_INFORMATION pi;
 	if (!CreateProcessA(exe.c_str(), &cmd[0], NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi))
@@ -660,8 +663,14 @@ int main(int argc, char** argv)
 	printf("==============================================\n");
 
 	// o instalador que acabou de ser baixado nao procura de novo (tag e versao desencontradas dariam laco)
+	bool updated = false;
+	for (int i = 1; i < argc; i++)
+	{
+		updated |= !strcmp(argv[i], "--atualizado");
+		g_onlyUpdate |= !strcmp(argv[i], "--atualizar");
+	}
 	int exitCode;
-	if ((argc < 2 || strcmp(argv[1], "--atualizado")) && Update(exitCode))
+	if (!updated && Update(exitCode))
 		return exitCode;
 
 	std::string game = FindGame();
@@ -683,6 +692,17 @@ int main(int argc, char** argv)
 	}
 	printf("\n  Jogo encontrado em: %s\n", game.c_str());
 	SyncDll(game);
+	if (g_onlyUpdate)
+	{
+		std::string lib;
+		ReadFile(game + "\\cryoffear\\liblist.gam", lib);
+		if (lib.find(GAMEDLL_MOD) == std::string::npos)
+			Install(game);
+		else
+			CopyTunnel(game + "\\cryoffear");
+		printf("\n  Pronto: mod na versao %s.\n", COFMP_VERSION);
+		return 0;
+	}
 
 	for (;;)
 	{

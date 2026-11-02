@@ -55,6 +55,7 @@ static cvar_t cv_model = { (char*)"cofmp_model", (char*)"simon", FCVAR_SERVER };
 static cvar_t cv_start_wait = { (char*)"cofmp_start_wait", (char*)"1", FCVAR_SERVER };
 static cvar_t cv_start_timeout = { (char*)"cofmp_start_timeout", (char*)"90", FCVAR_SERVER };
 static cvar_t cv_cutscene_wait = { (char*)"cofmp_cutscene_wait", (char*)"1", FCVAR_SERVER };
+static cvar_t cv_touchlog = { (char*)"cofmp_touchlog", (char*)"0", FCVAR_SERVER }; // diagnostico: toques jogador x trigger_*
 
 // ---------------------------------------------------------------- util
 
@@ -1277,6 +1278,11 @@ static void GatherThink()
 
 // ---------------------------------------------------------------- detour ChangeLevelNow
 
+// O cof_teleport leva so o ativador. No fim da abertura do c_intro ele poe o jogador 1 dentro da saida para o
+// c_nightmare, e o resto do grupo nunca chega la. Saida tocada logo depois de um cof_teleport e roteiro do mapa,
+// nao alguem andando ate ela: troca na hora, e o DoChangeLevel leva quem ficou longe para o lado do teleportado.
+static float g_scriptTeleportAt = -1000.0f;
+
 typedef void(__thiscall* ChangeLevelNow_t)(void* self, void* pActivator);
 static ChangeLevelNow_t g_ChangeLevelNowOrig; // trampolim
 
@@ -1304,7 +1310,10 @@ static void __fastcall Hook_ChangeLevelNow(void* self, void* /*edx*/, void* pAct
 	}
 
 	bool touch = act && IsPlayer(act) && Overlaps(act, pev->pContainingEntity);
-	if (!touch || !cv_exit_wait.value)
+	bool scripted = gpGlobals->time - g_scriptTeleportAt < 1.0f;
+	if (scripted)
+		Log("saida tocada logo depois de um cof_teleport: troca sem esperar o grupo");
+	if (!touch || !cv_exit_wait.value || scripted)
 	{
 		DoChangeLevel(idx, act);
 		return;
@@ -1324,6 +1333,18 @@ static void __fastcall Hook_ChangeLevelNow(void* self, void* /*edx*/, void* pAct
 static const DWORD RVA_ChangeLevelNow = 0x109d40;
 static const BYTE SIG_ChangeLevelNow[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x53, 0x8B, 0xD9 };
 static const int STOLEN = 6; // push ebp / mov ebp,esp / sub esp,8
+
+typedef void(__thiscall* Use_t)(void* self, void* pActivator, void* pCaller, int useType, float value);
+static Use_t g_TeleportUseOrig;
+static const DWORD RVA_VT_COF_TELEPORT = 0x1c5b50; // vtable do cof_teleport
+static const DWORD RVA_TeleportUse = 0xa7990;
+static const int VT_USE = 58;
+
+static void __fastcall Hook_TeleportUse(void* self, void* /*edx*/, void* pActivator, void* pCaller, int useType, float value)
+{
+	g_scriptTeleportAt = gpGlobals->time;
+	g_TeleportUseOrig(self, pActivator, pCaller, useType, value);
+}
 
 static void InstallDetour()
 {
@@ -1369,6 +1390,17 @@ static void InstallDetour()
 		g_SendInvSlot = (SendInvSlot_t)slot;
 	else
 		Log("aviso: assinatura de SendInvSlot nao confere - inventario pode sumir da tela ao renascer");
+
+	void** vt = (void**)((BYTE*)g_hl + RVA_VT_COF_TELEPORT);
+	DWORD vold;
+	if (vt[VT_USE] == (BYTE*)g_hl + RVA_TeleportUse && VirtualProtect(&vt[VT_USE], 4, PAGE_READWRITE, &vold))
+	{
+		g_TeleportUseOrig = (Use_t)vt[VT_USE];
+		vt[VT_USE] = (void*)&Hook_TeleportUse;
+		VirtualProtect(&vt[VT_USE], 4, vold, &vold);
+	}
+	else
+		Log("aviso: vtable do cof_teleport nao confere - saida do fim do c_intro vai esperar o grupo");
 
 	BYTE* fn = (BYTE*)g_hl + RVA_ChangeLevelNow;
 	if (memcmp(fn, SIG_ChangeLevelNow, sizeof(SIG_ChangeLevelNow)))
@@ -1551,6 +1583,8 @@ static void BotThink()
 
 // cofmp_use <classe> <x> <y> <z> [slot]: o jogador do slot (padrao: o primeiro humano vivo) "usa" a
 // entidade dessa classe mais perto do ponto (pegar item_key, abrir inter_door) sem precisar mirar nela.
+static std::string Describe(edict_t* e);
+
 static void Cmd_Use()
 {
 	if (g_eng->pfnCmd_Argc() < 5)
@@ -1584,6 +1618,13 @@ static void Cmd_Use()
 	}
 	Log("jogador %d '%s' usa %s #%d (a %.0f unidades do ponto)", g_eng->pfnIndexOfEdict(user), STRING(user->v.netname), cls,
 		g_eng->pfnIndexOfEdict(best), bestDist);
+	if (!_stricmp(g_eng->pfnCmd_Argv(0), "cofmp_touch"))
+	{
+		Log("  %s absmin %.0f %.0f %.0f absmax %.0f %.0f %.0f nextthink %.1f", Describe(best).c_str(), best->v.absmin.x,
+			best->v.absmin.y, best->v.absmin.z, best->v.absmax.x, best->v.absmax.y, best->v.absmax.z, best->v.nextthink);
+		g_orig.pfnTouch(best, user);
+		return;
+	}
 	g_orig.pfnUse(best, user);
 }
 
@@ -1683,6 +1724,7 @@ static struct
 	float releaseAt;
 	float nextMsg;
 	bool frozen[33]; // congelados por nos
+	std::vector<int> held; // gatilhos que alguem tocou durante a espera
 } g_hold;
 static int g_humansLast = -1; // humanos no mapa; no ServerActivate ainda e o valor do mapa anterior
 
@@ -1698,9 +1740,18 @@ static int CountHumans(bool aliveOnly)
 	return n;
 }
 
+static void ClearHold()
+{
+	g_hold.active = false;
+	g_hold.want = 0;
+	g_hold.deadline = g_hold.releaseAt = g_hold.nextMsg = 0;
+	memset(g_hold.frozen, 0, sizeof(g_hold.frozen));
+	g_hold.held.clear();
+}
+
 static void StartHold(bool fresh)
 {
-	memset(&g_hold, 0, sizeof(g_hold));
+	ClearHold();
 	if (!cv_enable.value || !cv_start_wait.value || gpGlobals->maxClients <= 1)
 		return;
 	g_hold.active = true;
@@ -1715,6 +1766,12 @@ static void StartHold(bool fresh)
 		fresh ? " (ou cofmp_go)" : "");
 }
 
+static void Hook_Touch(edict_t* touched, edict_t* other);
+static bool IsTriggerEnt(edict_t* e);
+
+// Quem nasce dentro de um gatilho (o trigger_once da abertura do c_intro fica em volta do info_player_start) so o
+// toca no primeiro frame, quando ainda estamos segurando; parado, o engine nao manda o toque de novo. Ao soltar,
+// toca de novo os gatilhos segurados com quem ainda esta dentro deles.
 static void ReleaseHold(const char* why)
 {
 	if (!g_hold.active)
@@ -1728,6 +1785,19 @@ static void ReleaseHold(const char* why)
 	}
 	CenterPrintAll(" ");
 	Log("comeco do mapa liberado (%s)", why);
+	std::vector<int> held;
+	held.swap(g_hold.held);
+	for (int idx : held)
+		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+		{
+			edict_t* trig = g_eng->pfnPEntityOfEntIndex(idx);
+			edict_t* o = PlayerAt(k);
+			if (IsNull(trig) || !IsTriggerEnt(trig) || trig->v.solid != SOLID_TRIGGER || !o || !IsAlive(o) || !Overlaps(o, trig))
+				continue;
+			Log("gatilho #%d '%s' tocado de novo por '%s' (estava dentro dele na espera)", idx, STRING(trig->v.classname),
+				STRING(o->v.netname));
+			Hook_Touch(trig, o);
+		}
 }
 
 static void HoldThink()
@@ -2083,8 +2153,24 @@ static bool PickupTouch(edict_t* item, edict_t* player);
 
 static void Hook_Touch(edict_t* touched, edict_t* other)
 {
+	if (cv_touchlog.value && IsTriggerEnt(touched) && !IsNull(other) && (other->v.flags & FL_CLIENT))
+	{
+		static float next[2048];
+		int t = g_eng->pfnIndexOfEdict(touched);
+		if (t < 2048 && gpGlobals->time >= next[t])
+		{
+			next[t] = gpGlobals->time + 2.0f;
+			Note("toque: %s #%d com jogador #%d (hold %d, cutscene %d)", STRING(touched->v.classname), t,
+				g_eng->pfnIndexOfEdict(other), (int)g_hold.active, (int)g_cutTrig.count(t));
+		}
+	}
 	if (g_hold.active && ((IsTriggerEnt(touched) && IsPlayer(other)) || (IsTriggerEnt(other) && IsPlayer(touched))))
+	{
+		int t = g_eng->pfnIndexOfEdict(IsTriggerEnt(touched) ? touched : other);
+		if (std::find(g_hold.held.begin(), g_hold.held.end(), t) == g_hold.held.end())
+			g_hold.held.push_back(t);
 		return;
+	}
 	if (!IsNull(touched) && !IsNull(other) && CutWaitTouch(touched, other))
 		return;
 	if (PickupTouch(touched, other))
@@ -2133,6 +2219,7 @@ static void Hook_GameInit()
 	g_eng->pfnCVarRegister(&cv_start_wait);
 	g_eng->pfnCVarRegister(&cv_start_timeout);
 	g_eng->pfnCVarRegister(&cv_cutscene_wait);
+	g_eng->pfnCVarRegister(&cv_touchlog);
 	g_eng->pfnAddServerCommand((char*)"cofmp_exits", Cmd_Exits);
 	g_eng->pfnAddServerCommand((char*)"cofmp_tp_exit", Cmd_TpExit);
 	g_eng->pfnAddServerCommand((char*)"cofmp_debug", Cmd_Debug);
@@ -2141,6 +2228,7 @@ static void Hook_GameInit()
 	g_eng->pfnAddServerCommand((char*)"cofmp_select", Cmd_Select);
 	g_eng->pfnAddServerCommand((char*)"cofmp_bot", Cmd_Bot);
 	g_eng->pfnAddServerCommand((char*)"cofmp_use", Cmd_Use);
+	g_eng->pfnAddServerCommand((char*)"cofmp_touch", Cmd_Use); // como cofmp_use, mas toca (diagnostico)
 	g_eng->pfnAddServerCommand((char*)"cofmp_tp", Cmd_Tp);
 	g_eng->pfnAddServerCommand((char*)"cofmp_kill", Cmd_Kill);
 	g_eng->pfnAddServerCommand((char*)"cofmp_revive", Cmd_Revive);
@@ -2190,6 +2278,7 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	ResetTrace();
 	g_netReset = true; // o carregamento do mapa nao conta como travada
 	g_changing = false;
+	g_scriptTeleportAt = -1000.0f;
 	g_gather.active = false;
 	memset(&g_arrive, 0, sizeof(g_arrive));
 	memset(g_wasAlive, 0, sizeof(g_wasAlive));
@@ -2231,7 +2320,7 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	if (_strnicmp(map, "c_game_menu", 11))
 		StartHold(g_humansLast <= 0 && !arrived && !restart);
 	else
-		memset(&g_hold, 0, sizeof(g_hold));
+		ClearHold();
 
 	// -cofmp_test <cfg>: roda um roteiro de teste no primeiro mapa de campanha (com cofmp_after)
 	static bool testDone;

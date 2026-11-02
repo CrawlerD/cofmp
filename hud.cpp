@@ -31,7 +31,8 @@ static std::string g_cry, g_tunnelDir;
 static DWORD g_codeStart;
 static HFONT g_font, g_bold;
 
-enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS, ID_GO, ID_CHANGE };
+enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS, ID_GO, ID_CHANGE, ID_SHOW_SIMON,
+	ID_SHOW_COPS, ID_SHOW_COMMUNITY };
 enum { WM_HUD_CMD = WM_APP + 0x43 };
 enum { TIMER_POLL = 1, TIMER_CODE, TIMER_CONNECT };
 static const int TUNNEL_PORT = 27020;
@@ -571,6 +572,8 @@ static void Poll()
 	enterDown = enter;
 }
 
+static void FillMaps();
+
 static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
 	switch (m)
@@ -600,6 +603,11 @@ static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			Status(L"Começando sem esperar os outros jogadores.");
 			ShowHud(false);
 			break;
+		case ID_SHOW_SIMON:
+		case ID_SHOW_COPS:
+		case ID_SHOW_COMMUNITY:
+			FillMaps();
+			break;
 		case ID_COPY:
 			if (!ItemText(ID_CODE).empty())
 			{
@@ -626,6 +634,55 @@ static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
 		return 0;
 	}
 	return DefWindowProcW(h, m, w, l);
+}
+
+// Lista de mapas do Home, separada em tres grupos que o jogador marca: a campanha do Simon (os mapas que o c_intro
+// alcanca pelas saidas, mais os do Doctor), a dos policiais (c_cof_*) e os mapas da comunidade (todo o resto).
+static const char* const SIMON_MAPS[] = { "c_apartment1", "c_apartment2", "c_apartment3", "c_apartment4",
+	"c_apartment5", "c_apartment3sick", "c_apartment4sick", "c_apartmentsick", "c_asylum1", "c_asylum1dark",
+	"c_asylum1day", "c_asylum2", "c_asylum2dark", "c_asylumb", "c_attic", "c_avlopp", "c_basement", "c_bridge",
+	"c_broscene", "c_buscity", "c_buscity2", "c_city", "c_city2", "c_college1", "c_college1dark", "c_college2",
+	"c_down", "c_ending1", "c_ending1b", "c_ending1c", "c_ending2", "c_ending2b", "c_ending2c", "c_ending3",
+	"c_ending3b", "c_ending3c", "c_ending4", "c_ending4b", "c_ending5", "c_ending5b", "c_ending5c", "c_forest1",
+	"c_forest2", "c_forest3", "c_forest4", "c_forest5", "c_forest6", "c_forest7", "c_forestday", "c_fsewer1",
+	"c_hamn", "c_hamn2", "c_hamn3", "c_intro", "c_lake", "c_nightmare", "c_park", "c_park2", "c_park3", "c_roofs",
+	"c_roofs2", "c_sewer", "c_sewer2", "c_sewer3", "c_stad", "c_start", "c_start2", "c_subtunnel1", "c_subtunnel2",
+	"c_subway1st1", "c_subway2st1", "c_subway2st2", "c_subway2st3", "c_subwaysick1", "c_subwaysick2", "c_trainride",
+	"c_trainride2", "c_trainscene", "c_village1", "c_village2", "c_village3", "c_doc_apartment3sick",
+	"c_doc_apartment4sick", "c_doc_appark", "c_doc_basement", "c_doc_city", "c_doc_ending", "c_doc_sewer",
+	"c_doc_sewer2", "c_doc_sewer3" };
+static const char* const MENU_MAPS[] = { "c_game_menu1", "c_loadgame", "c_difficulty_settings", "c_unlockables" };
+
+static int MapGroup(const char* name) // ID_SHOW_*, ou 0 para os mapas de menu do jogo
+{
+	for (const char* m : MENU_MAPS)
+		if (!_stricmp(name, m))
+			return 0;
+	for (const char* m : SIMON_MAPS)
+		if (!_stricmp(name, m))
+			return ID_SHOW_SIMON;
+	return _strnicmp(name, "c_cof_", 6) ? ID_SHOW_COMMUNITY : ID_SHOW_COPS;
+}
+
+static void FillMaps()
+{
+	HWND map = GetDlgItem(g_hud, ID_MAP);
+	std::string keep = ItemText(ID_MAP); // o que esta escrito fica, mesmo se o mapa sair da lista
+	SendMessageW(map, CB_RESETCONTENT, 0, 0);
+	WIN32_FIND_DATAA fd;
+	HANDLE fh = FindFirstFileA((g_cry + "\\maps\\c_*.bsp").c_str(), &fd);
+	if (fh != INVALID_HANDLE_VALUE)
+	{
+		do
+		{
+			*strrchr(fd.cFileName, '.') = 0;
+			int group = MapGroup(fd.cFileName);
+			if (group && IsDlgButtonChecked(g_hud, group) == BST_CHECKED)
+				SendMessageA(map, CB_ADDSTRING, 0, (LPARAM)fd.cFileName);
+		} while (FindNextFileA(fh, &fd));
+		FindClose(fh);
+	}
+	SetWindowTextA(map, keep.c_str());
 }
 
 static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id,
@@ -655,7 +712,7 @@ static void CreateHud()
 	wc.lpszClassName = L"cofmp_hud";
 	RegisterClassW(&wc);
 	const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-	RECT r = { 0, 0, 380, 352 };
+	RECT r = { 0, 0, 380, 380 };
 	AdjustWindowRectEx(&r, style, FALSE, ex);
 	g_hud = CreateWindowExW(ex, wc.lpszClassName, L"Cry of Fear co-op v" COFMP_VERSION, style, 0, 0, r.right - r.left,
 		r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
@@ -664,7 +721,7 @@ static void CreateHud()
 				E = WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL;
 	Ctl(L"STATIC", L"Cry of Fear — co-op", S, 12, 10, 356, 26, 0, g_bold);
 
-	Ctl(L"BUTTON", L"Hospedar", BS_GROUPBOX, 10, 40, 360, 128, 0);
+	Ctl(L"BUTTON", L"Hospedar", BS_GROUPBOX, 10, 40, 360, 156, 0);
 	Ctl(L"STATIC", L"Jogadores:", SC, 22, 62, 70, 23, 0);
 	HWND players = Ctl(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST, 95, 62, 55, 120, ID_PLAYERS);
 	for (const wchar_t* n : { L"2", L"3", L"4" })
@@ -673,34 +730,30 @@ static void CreateHud()
 	Ctl(L"STATIC", L"Mapa:", SC, 162, 62, 40, 23, 0);
 	HWND map = Ctl(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL | CBS_SORT, 205, 62,
 		150, 300, ID_MAP);
-	WIN32_FIND_DATAA fd;
-	HANDLE fh = FindFirstFileA((g_cry + "\\maps\\c_*.bsp").c_str(), &fd);
-	if (fh != INVALID_HANDLE_VALUE)
-	{
-		do
-		{
-			*strrchr(fd.cFileName, '.') = 0;
-			SendMessageA(map, CB_ADDSTRING, 0, (LPARAM)fd.cFileName);
-		} while (FindNextFileA(fh, &fd));
-		FindClose(fh);
-	}
+	const DWORD C = WS_TABSTOP | BS_AUTOCHECKBOX;
+	Ctl(L"STATIC", L"Mostrar:", SC, 22, 92, 70, 20, 0);
+	Ctl(L"BUTTON", L"Simon", C, 95, 92, 62, 20, ID_SHOW_SIMON);
+	Ctl(L"BUTTON", L"Policiais", C, 162, 92, 75, 20, ID_SHOW_COPS);
+	Ctl(L"BUTTON", L"Comunidade", C, 242, 92, 113, 20, ID_SHOW_COMMUNITY);
+	CheckDlgButton(g_hud, ID_SHOW_SIMON, BST_CHECKED);
 	SetWindowTextA(map, "c_intro"); // comeco do jogo, com a cutscene
-	Ctl(L"BUTTON", L"Criar servidor", B, 22, 94, 112, 28, ID_HOST);
-	Ctl(L"BUTTON", L"Trocar mapa", B, 139, 94, 104, 28, ID_CHANGE);
-	Ctl(L"BUTTON", L"Começar agora", B, 248, 94, 107, 28, ID_GO);
-	Ctl(L"STATIC", L"Código:", SC, 22, 132, 50, 23, 0);
-	Ctl(L"EDIT", L"", E | ES_READONLY, 75, 132, 200, 23, ID_CODE);
-	Ctl(L"BUTTON", L"Copiar", B, 282, 132, 73, 23, ID_COPY);
+	FillMaps();
+	Ctl(L"BUTTON", L"Criar servidor", B, 22, 122, 112, 28, ID_HOST);
+	Ctl(L"BUTTON", L"Trocar mapa", B, 139, 122, 104, 28, ID_CHANGE);
+	Ctl(L"BUTTON", L"Começar agora", B, 248, 122, 107, 28, ID_GO);
+	Ctl(L"STATIC", L"Código:", SC, 22, 160, 50, 23, 0);
+	Ctl(L"EDIT", L"", E | ES_READONLY, 75, 160, 200, 23, ID_CODE);
+	Ctl(L"BUTTON", L"Copiar", B, 282, 160, 73, 23, ID_COPY);
 
-	Ctl(L"BUTTON", L"Entrar no jogo de um amigo", BS_GROUPBOX, 10, 178, 360, 100, 0);
-	Ctl(L"STATIC", L"Código do host:", SC, 22, 200, 95, 23, 0);
-	Ctl(L"EDIT", L"", E | ES_NUMBER, 120, 200, 155, 23, ID_JOIN_CODE);
-	Ctl(L"BUTTON", L"Colar", B, 282, 200, 73, 23, ID_PASTE);
-	Ctl(L"BUTTON", L"Entrar", B, 22, 232, 333, 28, ID_JOIN);
+	Ctl(L"BUTTON", L"Entrar no jogo de um amigo", BS_GROUPBOX, 10, 206, 360, 100, 0);
+	Ctl(L"STATIC", L"Código do host:", SC, 22, 228, 95, 23, 0);
+	Ctl(L"EDIT", L"", E | ES_NUMBER, 120, 228, 155, 23, ID_JOIN_CODE);
+	Ctl(L"BUTTON", L"Colar", B, 282, 228, 73, 23, ID_PASTE);
+	Ctl(L"BUTTON", L"Entrar", B, 22, 260, 333, 28, ID_JOIN);
 
-	Ctl(L"STATIC", L"", S, 12, 288, 356, 36, ID_STATUS);
-	Ctl(L"STATIC", L"Home abre e fecha esta janela. Os dois usam a Steam aberta.", S, 12, 328, 296, 18, 0);
-	Ctl(L"STATIC", L"v" COFMP_VERSION, SS_RIGHT, 310, 328, 58, 18, 0);
+	Ctl(L"STATIC", L"", S, 12, 316, 356, 36, ID_STATUS);
+	Ctl(L"STATIC", L"Home abre e fecha esta janela. Os dois usam a Steam aberta.", S, 12, 356, 296, 18, 0);
+	Ctl(L"STATIC", L"v" COFMP_VERSION, SS_RIGHT, 310, 356, 58, 18, 0);
 	SetTimer(g_hud, TIMER_POLL, 30, NULL);
 }
 

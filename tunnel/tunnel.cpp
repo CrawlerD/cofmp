@@ -272,6 +272,12 @@ int main(int argc, char** argv)
 		char buf[32];
 		sprintf(buf, "%llu", me.v);
 		CopyToClipboard(buf);
+		FILE* cf = fopen("codigo.txt", "w"); // lido pela janela do jogo (tecla Home)
+		if (cf)
+		{
+			fputs(buf, cf);
+			fclose(cf);
+		}
 		game.sin_port = htons(gamePort);
 		printf("  Tunel aberto como %s.\n\n", g_friends->GetPersonaName());
 		printf("  Codigo para o seu amigo:  %s\n", buf);

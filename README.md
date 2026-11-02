@@ -54,6 +54,18 @@ cof.exe -game cryoffear -insecure +maxplayers 4 +map c_apartment1
 
 Os outros jogadores abrem o Cry of Fear e digitam no console (tecla `'`) `connect <ip do host>`. Pela internet o host precisa liberar a porta UDP 27015 no roteador, ou os dois entram na mesma VPN (Radmin VPN, ZeroTier, Hamachi) e usam o IP dela.
 
+### Janela do co-op no jogo (tecla Home)
+Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partida).
+- **Hospedar:** escolha o número de jogadores e o mapa e clique em "Criar servidor". A DLL roda `disconnect; sv_lan 0; maxplayers N; map X`, abre o túnel em modo host e mostra o código, que já vai para a área de transferência.
+- **Entrar:** cole o código (se ele já estiver copiado, aparece sozinho) e clique em "Entrar". O túnel conecta e, 3 s depois, a DLL roda `connect 127.0.0.1:27020`.
+
+Como funciona por dentro:
+- A janela é Win32 e roda numa thread do `cofmp.dll`, que o engine carrega no processo do jogo já no menu (`hud.cpp`).
+- Os comandos entram numa fila. Quem a esvazia na thread principal é a janela do jogo, que é subclassificada (`WM_HUD_CMD`), e também o `StartFrame`.
+- O instalador copia o túnel para `cryoffear\cl_dlls\cofmp_tunel`. O túnel grava o código em `codigo.txt` ao lado dele.
+- O túnel abre minimizado e entra num job object, então fecha junto com o jogo.
+- Em tela cheia, o jogo pode minimizar enquanto a janela está aberta.
+
 ### Sem abrir porta: túnel pela Steam
 O `CoF_Tunel.exe` (com o `steam_api.dll` ao lado) leva o tráfego do jogo pela rede P2P da Steam. Ele se identifica como Spacewar (appid 480), então a Steam mostra "jogando Spacewar" enquanto ele está aberto. Não precisa de VPN nem de porta aberta.
 1. **Host:** no instalador, opção **3**. O jogo abre hospedando e o túnel abre junto, mostrando um código (já copiado) para mandar ao amigo.

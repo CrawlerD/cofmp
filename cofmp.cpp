@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 #include "exports_fwd.h" // gerado por gen_def.py
+#include "hud.h"
 
 // Layout de entvars_t do Cry of Fear (sdk_cof/progdefs.h); offsets lidos de gEntvarsDescription no hl.dll.
 static_assert(offsetof(entvars_t, health) == 0x164, "entvars_t");
@@ -1405,6 +1406,7 @@ static void UnstickThink()
 
 static void Hook_StartFrame()
 {
+	Hud_RunPending();
 	g_orig.pfnStartFrame();
 	AfterThink();
 	if (!cv_enable.value || gpGlobals->maxClients <= 1)
@@ -1598,6 +1600,11 @@ static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* ep)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static void HudCommand(const char* cmd)
+{
+	g_eng->pfnServerCommand((char*)cmd);
+}
+
 extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* globals)
 {
 	g_eng = eng;
@@ -1605,6 +1612,7 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	static bool dumpInstalled;
 	if (!dumpInstalled)
 		dumpInstalled = AddVectoredExceptionHandler(0, CrashDumpHandler) != NULL;
+	Hud_Start(HudCommand);
 	if (!LoadHL())
 		return;
 	g_engForHL = *eng;

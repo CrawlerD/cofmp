@@ -310,6 +310,21 @@ static bool GameRunning()
 	return found;
 }
 
+static std::string ExeDir();
+
+// a janela do jogo (tecla Home) abre o tunel de cl_dlls\cofmp_tunel
+static const char* TUNNEL_FILES[] = { "CoF_Tunel.exe", "steam_api.dll" };
+
+static void CopyTunnel(const std::string& cry)
+{
+	std::string from = ExeDir(), to = cry + "\\cl_dlls\\cofmp_tunel";
+	if (!Exists(from + "\\CoF_Tunel.exe"))
+		return;
+	CreateDirectoryA(to.c_str(), NULL);
+	for (const char* f : TUNNEL_FILES)
+		CopyFileA((from + "\\" + f).c_str(), (to + "\\" + f).c_str(), FALSE);
+}
+
 static void Install(const std::string& game)
 {
 	std::string cry = game + "\\cryoffear";
@@ -331,7 +346,9 @@ static void Install(const std::string& game)
 		printf("\n  ERRO: nao consegui ajustar o liblist.gam.\n");
 		return;
 	}
+	CopyTunnel(cry);
 	printf("\n  Mod instalado! (backup do original em liblist.gam.orig)\n");
+	printf("  No jogo, aperte Home para hospedar ou entrar num servidor.\n");
 	InstallSimon(game);
 }
 
@@ -349,6 +366,10 @@ static void Uninstall(const std::string& game)
 		return;
 	}
 	DeleteFileA((cry + "\\cl_dlls\\cofmp.dll").c_str());
+	std::string tun = cry + "\\cl_dlls\\cofmp_tunel";
+	for (const char* f : { "CoF_Tunel.exe", "steam_api.dll", "steam_appid.txt", "codigo.txt" })
+		DeleteFileA((tun + "\\" + f).c_str());
+	RemoveDirectoryA(tun.c_str());
 	DeleteFileA((cry + "\\models\\player\\simon\\simon.mdl").c_str());
 	RemoveDirectoryA((cry + "\\models\\player\\simon").c_str());
 	printf("\n  Mod removido. O jogo voltou ao normal.\n");
@@ -620,6 +641,8 @@ static void SyncDll(const std::string& game)
 	ReadFile(cry + "\\liblist.gam", lib);
 	if (lib.find(GAMEDLL_MOD) == std::string::npos)
 		return;
+	if (!GameRunning())
+		CopyTunnel(cry); // tunel novo que veio com a atualizacao
 	HRSRC r = FindResourceA(NULL, MAKEINTRESOURCEA(1), (LPCSTR)RT_RCDATA);
 	HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
 	if (!g || (ReadFile(cry + "\\cl_dlls\\cofmp.dll", cur) &&

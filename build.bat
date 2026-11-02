@@ -9,8 +9,8 @@ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliar
 set PYTHONPATH=%LOCALAPPDATA%\Temp\cofre_re
 if not exist "%HERE%build" mkdir "%HERE%build"
 py "%HERE%gen_def.py" "%HLDLL%" "%HERE%build" || exit /b 1
-cl /nologo /LD /MT /O2 /EHsc /W3 /DWIN32 /D_CRT_SECURE_NO_WARNINGS ^
+cl /nologo /utf-8 /wd4828 /LD /MT /O2 /EHsc /W3 /DWIN32 /D_CRT_SECURE_NO_WARNINGS ^
   /I"%HERE%build" /I"%HERE%sdk_cof" /I"%SDK%\dlls" /I"%SDK%\engine" /I"%SDK%\common" /I"%SDK%\public" /I"%SDK%\pm_shared" ^
-  "%HERE%cofmp.cpp" /Fo"%HERE%build\\" /Fe"%HERE%build\cofmp.dll" ^
-  /link /DEF:"%HERE%build\cofmp.def" || exit /b 1
+  "%HERE%cofmp.cpp" "%HERE%hud.cpp" /Fo"%HERE%build\\" /Fe"%HERE%build\cofmp.dll" ^
+  /link /DEF:"%HERE%build\cofmp.def" /MANIFEST:EMBED || exit /b 1
 echo OK: %HERE%build\cofmp.dll

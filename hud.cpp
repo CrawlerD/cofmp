@@ -3,7 +3,7 @@
 // Roda numa thread propria do cofmp.dll no processo do jogo (o engine carrega o gamedll ja no menu).
 // Os comandos do console (map, connect...) precisam rodar na thread principal: ficam numa fila que a
 // janela do jogo (subclassificada) esvazia ao receber WM_HUD_CMD, e o StartFrame tambem esvazia.
-// O tunel (CoF_Tunel.exe + steam_api.dll) e copiado pelo instalador para cl_dlls\cofmp_tunel.
+// O tunel (CoF_Tunel.exe + steam_api.dll) e copiado pelo instalador para cryoffear\Mod coop\tunel.
 
 #include <windows.h>
 #include <commctrl.h>
@@ -12,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include "hud.h"
+#include "logfile.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -517,9 +518,9 @@ static DWORD WINAPI HudThread(void*)
 		(LPCSTR)&HudThread, &self);
 	GetModuleFileNameA(self, path, sizeof(path));
 	*strrchr(path, '\\') = 0; // ...\cryoffear\cl_dlls
-	g_tunnelDir = std::string(path) + "\\cofmp_tunel";
 	*strrchr(path, '\\') = 0;
 	g_cry = path;
+	g_tunnelDir = g_cry + "\\" COFMP_TUNNEL_DIR;
 
 	g_job = CreateJobObjectA(NULL, NULL);
 	JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};

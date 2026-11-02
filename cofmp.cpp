@@ -2218,14 +2218,16 @@ static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* ep)
 	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 		(LPCSTR)&CrashDumpHandler, &self);
 	GetModuleFileNameA(self, path, sizeof(path));
-	char* slash = strrchr(path, '\\'); // ...\cryoffear\cl_dlls\cofmp.dll -> ...\cryoffear\cofmp_crash_*.dmp
-	if (slash)
-		*slash = 0;
-	slash = strrchr(path, '\\');
+	// ...\cryoffear\cl_dlls\cofmp.dll -> ...\cryoffear\Mod coop\cofmp_crash_*.dmp
+	for (int up = 0; up < 2; up++)
+		if (char* s = strrchr(path, '\\'))
+			*s = 0;
 	SYSTEMTIME t;
 	GetLocalTime(&t);
-	sprintf(slash ? slash + 1 : path, "cofmp_crash_%04d%02d%02d_%02d%02d%02d.dmp", t.wYear, t.wMonth, t.wDay,
-		t.wHour, t.wMinute, t.wSecond);
+	size_t len = strlen(path);
+	_snprintf(path + len, sizeof(path) - len, "\\" COFMP_DIR "\\cofmp_crash_%04d%02d%02d_%02d%02d%02d.dmp", t.wYear,
+		t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+	path[sizeof(path) - 1] = 0;
 	HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (f == INVALID_HANDLE_VALUE)
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -2249,15 +2251,16 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	if (!dumpInstalled)
 	{
 		dumpInstalled = AddVectoredExceptionHandler(0, CrashDumpHandler) != NULL;
-		// log em ...\cryoffear\cofmp_log.txt (a dll fica em cryoffear\cl_dlls)
+		// log em ...\cryoffear\Mod coop\cofmp_log.txt (a dll fica em cryoffear\cl_dlls)
 		char dir[MAX_PATH];
 		HMODULE self;
 		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 			(LPCSTR)&CrashDumpHandler, &self);
-		GetModuleFileNameA(self, dir, sizeof(dir));
+		GetModuleFileNameA(self, dir, sizeof(dir) - sizeof("\\" COFMP_DIR));
 		for (int up = 0; up < 2; up++)
 			if (char* s = strrchr(dir, '\\'))
 				*s = 0;
+		strcat(dir, "\\" COFMP_DIR);
 		LogFile_Open(dir);
 		LogFile_Write("jogo", "---- cofmp v" COFMP_VERSION " carregado");
 	}

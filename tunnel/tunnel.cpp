@@ -372,12 +372,12 @@ int main(int argc, char** argv)
 	*strrchr(dir, '\\') = 0;
 	SetCurrentDirectoryA(dir);
 	{
-		// instalado: cryoffear\cl_dlls\cofmp_tunel -> log em cryoffear; rodando de outra pasta: log nela
+		// instalado: cryoffear\Mod coop\tunel -> log em Mod coop; rodando de outra pasta: log nela
 		char logDir[MAX_PATH];
 		strcpy(logDir, dir);
-		size_t L = strlen(logDir), S = strlen("\\cl_dlls\\cofmp_tunel");
-		if (L > S && !_stricmp(logDir + L - S, "\\cl_dlls\\cofmp_tunel"))
-			logDir[L - S] = 0;
+		size_t L = strlen(logDir), S = strlen("\\" COFMP_TUNNEL_DIR);
+		if (L > S && !_stricmp(logDir + L - S, "\\" COFMP_TUNNEL_DIR))
+			logDir[L - S + strlen("\\" COFMP_DIR)] = 0;
 		LogFile_Open(logDir);
 	}
 	Note("---- tunel v%s aberto: %s", COFMP_VERSION, GetCommandLineA());

@@ -29,9 +29,17 @@ Proxy do server DLL (`hl.dll`). O engine carrega `cofmp.dll`, que repassa todos 
 Manual:
 1. Rode `build.bat`, que gera `build\cofmp.dll`.
 2. Copie a DLL para `Cry of Fear\cryoffear\cl_dlls\`.
-3. No `cryoffear\liblist.gam`, troque `gamedll "cl_dlls/hl.dll"` por `gamedll "cl_dlls/cofmp.dll"`. O original fica salvo em `liblist.gam.orig`.
+3. No `cryoffear\liblist.gam`, troque `gamedll "cl_dlls/hl.dll"` por `gamedll "cl_dlls/cofmp.dll"`. O instalador guarda o original em `cryoffear\Mod coop\liblist.gam.orig`.
 
 Para desinstalar, restaure o `liblist.gam.orig`. Verificar os arquivos na Steam também desfaz a troca.
+
+**Pasta `cryoffear\Mod coop` (v1.9):** o instalador cria essa pasta, e tudo do mod que pode ficar fora do lugar do jogo vai para lá:
+- o log (`cofmp_log.txt` e `cofmp_log_anterior.txt`);
+- os crash dumps (`cofmp_crash_<data>.dmp`);
+- o backup `liblist.gam.orig`;
+- o túnel, na subpasta `tunel` (`CoF_Tunel.exe`, `steam_api.dll` e os arquivos que ele cria).
+
+Ficam fora só o que o jogo procura num lugar fixo: `cl_dlls\cofmp.dll` (o `gamedll` do `liblist.gam`, ao lado do `hl.dll` original), o próprio `liblist.gam` e `models\player\simon\simon.mdl`. Ao instalar ou atualizar, os arquivos das versões antigas (`cl_dlls\cofmp_tunel`, log, dumps e backup soltos em `cryoffear`) são levados para a pasta nova ou apagados. A opção 2 (desinstalar) apaga a pasta inteira.
 
 ### Atualização automática
 Toda vez que abre, o `CoF_Coop_Mod.exe` consulta a última release do GitHub. Se a tag for mais nova que a versão dele, baixa os arquivos soltos da release para a própria pasta, troca os antigos e reabre já atualizado. Se o mod estava instalado, a DLL do jogo é trocada na hora (com o jogo fechado). Sem internet, ele segue com a versão que tem.
@@ -66,7 +74,7 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 
 **Espera antes das cutscenes (v1.8):** no `ServerActivate`, a DLL procura os `trigger_once`/`trigger_multiple` cuja cadeia de alvos (`target`, chaves do `multi_manager`, `trigger_relay`, até 6 níveis) chega numa `trigger_camera`. Ficam de fora os gatilhos com `master` (podem estar travados) e os com a flag "no clients". Quem toca um desses primeiro fica congelado e imortal dentro dele, e o toque é segurado. Quando todos os humanos do servidor estão vivos a até 96 unidades do gatilho, o `Touch` é chamado com o primeiro que chegou. Quem está morto também conta, então o grupo espera essa pessoa renascer. O host pode soltar antes com `cofmp_go`. Enquanto uma `trigger_camera` está ligada, todos ficam imortais: `takedamage` vai para `DAMAGE_NO`, `FL_GODMODE` liga e a vida não cai. Os valores de antes voltam quando a câmera desliga. Desliga com `cofmp_cutscene_wait 0`. Com `2`, os bots também contam, para testar sozinho.
 
-**Log (v1.8):** o `cofmp.dll` e o túnel escrevem em `cryoffear\cofmp_log.txt`, com as tags `[jogo]` e `[tunel]`. Passando de 5 MB, o arquivo vira `cofmp_log_anterior.txt`. O log tem:
+**Log (v1.8):** o `cofmp.dll` e o túnel escrevem em `cryoffear\Mod coop\cofmp_log.txt` (até a v1.8, `cryoffear\cofmp_log.txt`), com as tags `[jogo]` e `[tunel]`. Passando de 5 MB, o arquivo vira `cofmp_log_anterior.txt`. O log tem:
 - tudo o que sai como `[cofmp]` no console;
 - conexões e comandos dos clientes (repetições seguidas viram uma linha só);
 - a cada 10 s, ping e perda de cada jogador e os fps do servidor;
@@ -80,7 +88,7 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 Como funciona por dentro:
 - A janela é Win32 e roda numa thread do `cofmp.dll`, que o engine carrega no processo do jogo já no menu (`hud.cpp`).
 - Os comandos entram numa fila. Quem a esvazia na thread principal é a janela do jogo, que é subclassificada (`WM_HUD_CMD`), e também o `StartFrame`.
-- O instalador copia o túnel para `cryoffear\cl_dlls\cofmp_tunel`. O túnel grava o código em `codigo.txt` ao lado dele.
+- O instalador copia o túnel para `cryoffear\Mod coop\tunel`. O túnel grava o código em `codigo.txt` ao lado dele.
 - O túnel abre minimizado e entra num job object, então fecha junto com o jogo.
 - Em tela cheia, o jogo pode minimizar enquanto a janela está aberta.
 
@@ -96,7 +104,7 @@ Pacotes do jogo com mais de 1200 bytes, o limite do envio sem confirmação da S
 As duas janelas do túnel ficam abertas enquanto jogam. Também dá para rodar direto: `CoF_Tunel.exe host [porta do jogo]` ou `CoF_Tunel.exe join <código> [porta local]`.
 
 ### Crashes
-Se o jogo crashar com o mod carregado (no PC de quem hospeda), o mod grava `cryoffear\cofmp_crash_<data>.dmp`. Mande esse arquivo para análise.
+Se o jogo crashar com o mod carregado (no PC de quem hospeda), o mod grava `cryoffear\Mod coop\cofmp_crash_<data>.dmp`. Mande esse arquivo para análise.
 
 ## Cvars e comandos (servidor)
 | | |

@@ -1,15 +1,21 @@
-// Arquivo de log do co-op (cryoffear\cofmp_log.txt), escrito pelo cofmp.dll ("jogo") e pelo tunel ("tunel").
+// Arquivo de log do co-op (cryoffear\Mod coop\cofmp_log.txt), escrito pelo cofmp.dll ("jogo") e pelo tunel ("tunel").
 // Cada linha e um WriteFile em modo append, entao os dois processos podem escrever ao mesmo tempo.
 #pragma once
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
+// Pasta do mod dentro de cryoffear: log, crash dumps, backup do liblist.gam e o tunel (subpasta tunel).
+// Ficam fora dela so o que o jogo precisa achar no lugar dele: cl_dlls\cofmp.dll, o liblist.gam e o simon.mdl.
+#define COFMP_DIR "Mod coop"
+#define COFMP_TUNNEL_DIR COFMP_DIR "\\tunel"
+
 static char g_logPath[MAX_PATH];
 
-// dir: pasta cryoffear (sem barra no fim)
+// dir: pasta Mod coop (sem barra no fim); cria se nao existir
 static void LogFile_Open(const char* dir)
 {
+	CreateDirectoryA(dir, NULL);
 	_snprintf(g_logPath, sizeof(g_logPath), "%s\\cofmp_log.txt", dir);
 	g_logPath[sizeof(g_logPath) - 1] = 0;
 	// passou de 5 MB: guarda o anterior e comeca outro

@@ -14,6 +14,7 @@
 #include <sstream>
 #include <iostream>
 #include <math.h>
+#include "../logfile.h" // COFMP_DIR
 
 // le uma linha sem BOM, \r e espacos nas pontas (entrada redirecionada vem com \r\n)
 static bool ReadLine(std::string& out)
@@ -312,12 +313,70 @@ static bool GameRunning()
 
 static std::string ExeDir();
 
-// a janela do jogo (tecla Home) abre o tunel de cl_dlls\cofmp_tunel
+// a janela do jogo (tecla Home) abre o tunel de cryoffear\Mod coop\tunel
 static const char* TUNNEL_FILES[] = { "CoF_Tunel.exe", "steam_api.dll" };
+// o que o tunel cria na pasta dele
+static const char* TUNNEL_TEMP[] = { "steam_appid.txt", "codigo.txt", "conectado.txt" };
 
-static void CopyTunnel(const std::string& cry)
+static void DeleteMatching(const std::string& dir, const char* pattern)
 {
-	std::string from = ExeDir(), to = cry + "\\cl_dlls\\cofmp_tunel";
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA((dir + "\\" + pattern).c_str(), &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+			DeleteFileA((dir + "\\" + fd.cFileName).c_str());
+	while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+static void DeleteTunnel(const std::string& tun)
+{
+	for (const char* f : TUNNEL_FILES)
+		DeleteFileA((tun + "\\" + f).c_str());
+	for (const char* f : TUNNEL_TEMP)
+		DeleteFileA((tun + "\\" + f).c_str());
+	RemoveDirectoryA(tun.c_str());
+}
+
+// Ate a v1.8 o tunel ficava em cl_dlls\cofmp_tunel e o log, os crash dumps e o backup do liblist.gam
+// soltos em cryoffear: leva o que der para a pasta Mod coop e apaga o resto.
+static void MoveOldFiles(const std::string& cry)
+{
+	std::string mod = cry + "\\" COFMP_DIR;
+	DeleteTunnel(cry + "\\cl_dlls\\cofmp_tunel");
+	auto move = [&](const std::string& name, const std::string& to) {
+		std::string from = cry + "\\" + name;
+		if (Exists(from) && !MoveFileExA(from.c_str(), (mod + "\\" + to).c_str(), MOVEFILE_REPLACE_EXISTING))
+			DeleteFileA(from.c_str());
+	};
+	move("cofmp_log_anterior.txt", "cofmp_log_anterior.txt");
+	// a dll nova ja pode ter comecado um log na pasta nova: o antigo vira o anterior
+	move("cofmp_log.txt", Exists(mod + "\\cofmp_log.txt") ? "cofmp_log_anterior.txt" : "cofmp_log.txt");
+	if (!Exists(mod + "\\liblist.gam.orig"))
+		move("liblist.gam.orig", "liblist.gam.orig");
+	DeleteFileA((cry + "\\liblist.gam.orig").c_str());
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA((cry + "\\cofmp_crash_*.dmp").c_str(), &fd);
+	if (h != INVALID_HANDLE_VALUE)
+	{
+		std::vector<std::string> dumps;
+		do
+			dumps.push_back(fd.cFileName);
+		while (FindNextFileA(h, &fd));
+		FindClose(h);
+		for (const std::string& d : dumps)
+			move(d, d);
+	}
+}
+
+// cria cryoffear\Mod coop, traz os arquivos das versoes antigas e copia o tunel
+static void SetupModDir(const std::string& cry)
+{
+	std::string mod = cry + "\\" COFMP_DIR, to = cry + "\\" COFMP_TUNNEL_DIR, from = ExeDir();
+	CreateDirectoryA(mod.c_str(), NULL);
+	MoveOldFiles(cry);
 	if (!Exists(from + "\\CoF_Tunel.exe"))
 		return;
 	CreateDirectoryA(to.c_str(), NULL);
@@ -338,16 +397,16 @@ static void Install(const std::string& game)
 		printf("\n  ERRO: nao consegui copiar o cofmp.dll para %s\\cl_dlls.\n", cry.c_str());
 		return;
 	}
-	std::string lib = cry + "\\liblist.gam";
-	if (!Exists(lib + ".orig"))
-		CopyFileA(lib.c_str(), (lib + ".orig").c_str(), TRUE);
+	SetupModDir(cry);
+	std::string lib = cry + "\\liblist.gam", orig = cry + "\\" COFMP_DIR "\\liblist.gam.orig";
+	if (!Exists(orig))
+		CopyFileA(lib.c_str(), orig.c_str(), TRUE);
 	if (!SetGameDll(lib, GAMEDLL_ORIG, GAMEDLL_MOD))
 	{
 		printf("\n  ERRO: nao consegui ajustar o liblist.gam.\n");
 		return;
 	}
-	CopyTunnel(cry);
-	printf("\n  Mod instalado! (backup do original em liblist.gam.orig)\n");
+	printf("\n  Mod instalado! Arquivos do mod (log, tunel, backup do liblist.gam) em cryoffear\\" COFMP_DIR ".\n");
 	printf("  No jogo, aperte Home para hospedar ou entrar num servidor.\n");
 	InstallSimon(game);
 }
@@ -366,10 +425,12 @@ static void Uninstall(const std::string& game)
 		return;
 	}
 	DeleteFileA((cry + "\\cl_dlls\\cofmp.dll").c_str());
-	std::string tun = cry + "\\cl_dlls\\cofmp_tunel";
-	for (const char* f : { "CoF_Tunel.exe", "steam_api.dll", "steam_appid.txt", "codigo.txt" })
-		DeleteFileA((tun + "\\" + f).c_str());
-	RemoveDirectoryA(tun.c_str());
+	MoveOldFiles(cry); // o que sobrou de versoes antigas vai para Mod coop e some junto
+	std::string mod = cry + "\\" COFMP_DIR;
+	DeleteTunnel(cry + "\\" COFMP_TUNNEL_DIR);
+	for (const char* p : { "cofmp_log*.txt", "cofmp_crash_*.dmp", "liblist.gam.orig" })
+		DeleteMatching(mod, p);
+	RemoveDirectoryA(mod.c_str()); // so se ficou vazia
 	DeleteFileA((cry + "\\models\\player\\simon\\simon.mdl").c_str());
 	RemoveDirectoryA((cry + "\\models\\player\\simon").c_str());
 	printf("\n  Mod removido. O jogo voltou ao normal.\n");
@@ -662,7 +723,7 @@ static void SyncDll(const std::string& game)
 	if (lib.find(GAMEDLL_MOD) == std::string::npos)
 		return;
 	if (!GameRunning())
-		CopyTunnel(cry); // tunel novo que veio com a atualizacao
+		SetupModDir(cry); // tunel novo que veio com a atualizacao
 	HRSRC r = FindResourceA(NULL, MAKEINTRESOURCEA(1), (LPCSTR)RT_RCDATA);
 	HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
 	if (!g || (ReadFile(cry + "\\cl_dlls\\cofmp.dll", cur) &&
@@ -727,7 +788,7 @@ int main(int argc, char** argv)
 		if (lib.find(GAMEDLL_MOD) == std::string::npos)
 			Install(game);
 		else
-			CopyTunnel(game + "\\cryoffear");
+			SetupModDir(game + "\\cryoffear");
 		printf("\n  Pronto: mod na versao %s.\n", COFMP_VERSION);
 		return 0;
 	}

@@ -11,6 +11,7 @@
 //  - Cada jogador chega no mapa novo na mesma posicao relativa ao info_landmark.
 
 #include "extdll.h"
+#include "studio.h"
 #include <intrin.h>
 #include <psapi.h>
 #include <algorithm>
@@ -49,6 +50,7 @@ static cvar_t cv_exit_timeout = { (char*)"cofmp_exit_timeout", (char*)"0", FCVAR
 static cvar_t cv_keep_inv = { (char*)"cofmp_keep_inventory", (char*)"1", FCVAR_SERVER };
 static cvar_t cv_share_items = { (char*)"cofmp_share_items", (char*)"1", FCVAR_SERVER };
 static cvar_t cv_respawn_time = { (char*)"cofmp_respawn_time", (char*)"30", FCVAR_SERVER };
+static cvar_t cv_selfrespawn_time = { (char*)"cofmp_selfrespawn_time", (char*)"10", FCVAR_SERVER }; // pulo so renasce depois disso
 static cvar_t cv_model = { (char*)"cofmp_model", (char*)"simon", FCVAR_SERVER };
 static cvar_t cv_start_wait = { (char*)"cofmp_start_wait", (char*)"1", FCVAR_SERVER };
 static cvar_t cv_start_timeout = { (char*)"cofmp_start_timeout", (char*)"90", FCVAR_SERVER };
@@ -352,6 +354,13 @@ static bool GiveInvItem(void* pl, const std::string& file)
 	return g_AddToInventory(pl, EngString(file), EngString(""), EngString("item_key")) != 0;
 }
 
+// chaveiro do grupo (ShareThink, mais abaixo)
+static std::vector<std::string> g_keyring;
+static std::vector<std::string> g_seen[33]; // itens de cada jogador na ultima varredura
+static bool g_seenValid[33];
+static float g_nextShare;
+static float g_giveRetryAt[33];
+
 struct SavedWeapon
 {
 	std::string cls;
@@ -372,7 +381,14 @@ static struct SavedInv
 	int ammo[AMMO_SLOTS];
 	int flashBattery;
 	int goodPoints;
+	std::string slot[7], slotModel[7], slotClass[7]; // inventorySlot* exatos ("" = vazio)
+	bool afterDeath; // devolver apos morte/revive: refaz os slots exatamente como na foto
 } g_inv[33];
+
+static std::string StrOrEmpty(int str)
+{
+	return str ? STRING(str) : "";
+}
 
 static void CaptureInventory(int i, edict_t* p, bool quiet = false)
 {
@@ -405,6 +421,13 @@ static void CaptureInventory(int i, edict_t* p, bool quiet = false)
 	std::stable_sort(s.weapons.begin(), s.weapons.end(),
 		[](const SavedWeapon& a, const SavedWeapon& b) { return a.slot < b.slot; });
 	s.items = ItemsOf(pl);
+	s.afterDeath = false;
+	for (int k = 0; k < 7; k++)
+	{
+		s.slot[k] = StrOrEmpty(Field<int>(pl, OFS_INV_SLOT + k * 4));
+		s.slotModel[k] = StrOrEmpty(Field<int>(pl, OFS_INV_MODEL + k * 4));
+		s.slotClass[k] = StrOrEmpty(Field<int>(pl, OFS_INV_CLASS + k * 4));
+	}
 	entvars_t* act = PevOf(Field<void*>(pl, OFS_ACTIVE_ITEM));
 	s.active = act ? STRING(act->classname) : "";
 	memcpy(s.ammo, &Field<int>(pl, OFS_AMMO), sizeof(s.ammo));
@@ -415,9 +438,16 @@ static void CaptureInventory(int i, edict_t* p, bool quiet = false)
 		(int)s.items.size(), s.active.c_str());
 }
 
+static void RestoreAfterDeath(int i, edict_t* p);
+
 static void RestoreInventory(int i, edict_t* p)
 {
 	SavedInv& s = g_inv[i];
+	if (s.afterDeath)
+	{
+		RestoreAfterDeath(i, p);
+		return;
+	}
 	void* pl = p->pvPrivateData;
 	int before[AMMO_SLOTS];
 	memcpy(before, &Field<int>(pl, OFS_AMMO), sizeof(before));
@@ -527,11 +557,6 @@ static void RestoreThink()
 // ele some de todos. Assim ninguem fica preso atras de uma porta e o item nao se multiplica.
 // Funciona por varredura do inventorySlot, sem hook: pega qualquer jeito de ganhar/perder item.
 
-static std::vector<std::string> g_keyring;
-static std::vector<std::string> g_seen[33]; // itens de cada jogador na ultima varredura
-static bool g_seenValid[33];
-static float g_nextShare;
-static float g_giveRetryAt[33];
 
 static std::string ItemName(const std::string& file)
 {
@@ -640,8 +665,9 @@ static void ResetKeyring()
 // CBasePlayer::StartRevive, que toca a animacao "revived" e levanta o jogador com 30 de vida.
 // O jogador caido ve "Press jump to respawn (lose weapons) or wait to be revived".
 // Aqui:
-//  - ninguem renasce sozinho logo de cara: o grupo tem tempo de reviver;
-//  - se o caido apertar pular (ou passar cofmp_respawn_time sem revive), renasce perto de um
+//  - reviver nao precisa de item: Usar perto do caido (ReviveUseThink);
+//  - ninguem renasce sozinho antes de cofmp_selfrespawn_time (10 s): o grupo tem tempo de reviver;
+//  - se o caido apertar pular depois disso (ou passar cofmp_respawn_time sem revive), renasce perto de um
 //    companheiro vivo com os itens da ultima foto do inventario, em vez de perder as armas;
 //  - quem volta a vida (revive ou respawn nativo) recebe de volta o que faltar da foto, e se o
 //    respawn nativo o jogou longe, e levado para perto do grupo.
@@ -697,6 +723,264 @@ static void ResendInventoryThink()
 static const float REVIVING = 3.0f; // pev->fuser3 durante a animacao de revive
 
 static float g_deadSince[33];
+
+// Armas que o jogador tinha ao morrer. A morte zera os slots do inventario mas mantem as armas; o Spawn
+// do renascer da uma pistola nova. Arma que nao estava na foto nem com o jogador na morte e dessas.
+static std::vector<std::pair<edict_t*, int>> g_deathWeapons[33];
+
+static void RememberDeathWeapons(int i, void* pl)
+{
+	g_deathWeapons[i].clear();
+	ForEachItem(pl, [&](void* it) {
+		entvars_t* pev = PevOf(it);
+		if (pev && pev->pContainingEntity)
+			g_deathWeapons[i].push_back({ pev->pContainingEntity, pev->pContainingEntity->serialnumber });
+	});
+}
+
+static bool HadAtDeath(int i, void* it)
+{
+	entvars_t* pev = PevOf(it);
+	edict_t* e = pev ? pev->pContainingEntity : nullptr;
+	for (const auto& w : g_deathWeapons[i])
+		if (w.first == e && w.second == e->serialnumber)
+			return true;
+	return false;
+}
+
+enum
+{
+	OFS_CLIENT_ACTIVE_ITEM = 0x2530, // m_pClientActiveItem
+	OFS_SWITCH_ITEM = 0x2538,        // arma que o SelectLastItem vai sacar
+};
+
+// Tira a arma do jogador (listas, arma na mao) e apaga a entidade, sem largar nada no chao.
+static void RemoveWeapon(void* pl, void* it)
+{
+	for (int s = 0; s < 6; s++)
+	{
+		void** link = &Field<void*>(pl, OFS_PLAYER_ITEMS + s * 4);
+		for (int guard = 0; *link && guard < 64; guard++)
+		{
+			if (*link == it)
+			{
+				*link = Field<void*>(it, OFS_ITEM_NEXT);
+				break;
+			}
+			link = &Field<void*>(*link, OFS_ITEM_NEXT);
+		}
+	}
+	entvars_t* ppev = PevOf(pl);
+	if (Field<void*>(pl, OFS_ACTIVE_ITEM) == it)
+	{
+		Field<void*>(pl, OFS_ACTIVE_ITEM) = nullptr;
+		ppev->viewmodel = 0;
+		ppev->weaponmodel = 0;
+	}
+	if (Field<void*>(pl, OFS_CLIENT_ACTIVE_ITEM) == it)
+		Field<void*>(pl, OFS_CLIENT_ACTIVE_ITEM) = nullptr;
+	if (Field<void*>(pl, OFS_LAST_ITEM) == it)
+		Field<void*>(pl, OFS_LAST_ITEM) = nullptr;
+	if (Field<void*>(pl, OFS_SWITCH_ITEM) == it)
+		Field<void*>(pl, OFS_SWITCH_ITEM) = nullptr;
+	int id = Field<int>(it, OFS_ITEM_ID);
+	if (id > 0 && id < 32)
+		ppev->weapons &= ~(1 << id);
+	Field<void*>(it, OFS_ITEM_PLAYER) = nullptr;
+	entvars_t* w = PevOf(it);
+	w->effects |= EF_NODRAW;
+	w->flags |= FL_KILLME;
+}
+
+// Depois de morrer (renascer ou revive): devolve as armas que faltam, apaga a pistola extra do Spawn e
+// regrava os 7 slots exatamente como na foto, na mesma posicao (o atalho do quick select continua certo).
+// Item que o grupo gastou enquanto o jogador estava caido nao volta.
+static void RestoreAfterDeath(int i, edict_t* p)
+{
+	SavedInv& s = g_inv[i];
+	void* pl = p->pvPrivateData;
+	s.afterDeath = false;
+	int before[AMMO_SLOTS];
+	memcpy(before, &Field<int>(pl, OFS_AMMO), sizeof(before));
+
+	int given = 0, removed = 0;
+	for (const SavedWeapon& w : s.weapons)
+	{
+		void* it = FindItem(pl, w.cls.c_str());
+		if (it)
+		{
+			Field<int>(it, OFS_ITEM_CLIP) = max(Field<int>(it, OFS_ITEM_CLIP), w.clip);
+			continue;
+		}
+		g_GiveNamedItem(pl, STRING(EngString(w.cls)), false, true);
+		it = FindItem(pl, w.cls.c_str());
+		if (it)
+		{
+			Field<int>(it, OFS_ITEM_CLIP) = w.clip;
+			given++;
+		}
+		else
+			Log("jogador %d: nao consegui devolver '%s'", i, w.cls.c_str());
+	}
+
+	std::vector<void*> extra;
+	ForEachItem(pl, [&](void* it) {
+		entvars_t* pev = PevOf(it);
+		if (!pev || HadAtDeath(i, it))
+			return;
+		for (const SavedWeapon& w : s.weapons)
+			if (w.cls == STRING(pev->classname))
+				return;
+		extra.push_back(it);
+	});
+	for (void* it : extra)
+	{
+		Log("jogador %d: tirando '%s' que o renascer deu a mais", i, STRING(PevOf(it)->classname));
+		RemoveWeapon(pl, it);
+		removed++;
+	}
+
+	std::string slots;
+	for (int k = 0; k < 7; k++)
+	{
+		std::string f = s.slot[k];
+		if (!f.empty() && IsWeaponFile(f.c_str()))
+		{
+			size_t a = f.find_last_of('/'), b = f.rfind(".txt");
+			std::string cls = f.substr(a + 1, b == std::string::npos || b <= a ? std::string::npos : b - a - 1);
+			if (!FindItem(pl, cls.c_str()))
+				f.clear();
+		}
+		else if (!f.empty() && cv_share_items.value && !Has(g_keyring, f))
+			f.clear(); // gasto pelo grupo
+		Field<int>(pl, OFS_INV_SLOT + k * 4) = f.empty() ? 0 : EngString(f);
+		Field<int>(pl, OFS_INV_MODEL + k * 4) = f.empty() || s.slotModel[k].empty() ? 0 : EngString(s.slotModel[k]);
+		Field<int>(pl, OFS_INV_CLASS + k * 4) = f.empty() || s.slotClass[k].empty() ? 0 : EngString(s.slotClass[k]);
+		if (k && g_SendInvSlot)
+			g_SendInvSlot(pl, k, Field<int>(pl, OFS_INV_SLOT + k * 4), 0);
+		slots += f.empty() ? " -" : " " + ItemName(f);
+	}
+	g_seenValid[i] = false; // os slots mudaram por fora: o ShareThink nao pode achar que algo foi gasto
+
+	int* ammo = &Field<int>(pl, OFS_AMMO);
+	for (int k = 0; k < AMMO_SLOTS; k++)
+		ammo[k] = max(before[k], s.ammo[k]);
+	Field<int>(pl, OFS_FLASH_BATTERY) = s.flashBattery;
+	Field<int>(pl, OFS_GOOD_POINTS) = s.goodPoints;
+	Log("inventario do jogador %d refeito depois da morte: [%s ] (%d arma(s) devolvida(s), %d a mais tirada(s))", i,
+		slots.c_str(), given, removed);
+}
+
+// ---- corpo no chao
+// O Killed do jogo poe a sequencia "death" (ou "crouch_death"), mas o corpo ficava de pe nas duas telas.
+// Enquanto o jogador esta caido o mod mantem a sequencia de morte com o quadro calculado pelo tempo desde a
+// morte; com framerate 1 o cliente anda os quadros entre um pacote e outro e para no ultimo (deitado).
+static int g_deathSeq[33];
+static float g_deathFps[33];
+static int g_deathFrames[33];
+static int g_poseLog[33];
+
+static int FindSequence(edict_t* e, const char* name, float* fps, int* frames)
+{
+	studiohdr_t* h = (studiohdr_t*)g_eng->pfnGetModelPtr(e);
+	if (!h)
+		return -1;
+	mstudioseqdesc_t* sq = (mstudioseqdesc_t*)((byte*)h + h->seqindex);
+	for (int k = 0; k < h->numseq; k++)
+		if (!_stricmp(sq[k].label, name))
+		{
+			*fps = sq[k].fps;
+			*frames = sq[k].numframes;
+			return k;
+		}
+	return -1;
+}
+
+static void StartDeathPose(int i, edict_t* p)
+{
+	const char* anim = (p->v.flags & FL_DUCKING) ? "crouch_death" : "death";
+	g_deathSeq[i] = FindSequence(p, anim, &g_deathFps[i], &g_deathFrames[i]);
+	if (g_deathSeq[i] < 0)
+		g_deathSeq[i] = FindSequence(p, anim = "death", &g_deathFps[i], &g_deathFrames[i]);
+	g_poseLog[i] = 0;
+	Log("jogador %d caiu: sequencia %d frame %.0f framerate %.2f gait %d -> '%s' (#%d, %d quadros a %.0f fps)", i,
+		p->v.sequence, p->v.frame, p->v.framerate, p->v.gaitsequence, anim, g_deathSeq[i], g_deathFrames[i], g_deathFps[i]);
+}
+
+static void DeathPoseThink()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || IsAlive(p) || !g_deadSince[i] || g_deathSeq[i] < 0 || p->v.fuser3 == REVIVING)
+			continue;
+		if (p->v.sequence != g_deathSeq[i] && g_poseLog[i]++ < 3)
+			Log("jogador %d caido: o jogo trocou a sequencia do corpo para %d (frame %.0f framerate %.2f)", i,
+				p->v.sequence, p->v.frame, p->v.framerate);
+		float t = gpGlobals->time - g_deadSince[i];
+		float frame = g_deathFrames[i] > 1 ? t * g_deathFps[i] * 256.0f / (g_deathFrames[i] - 1) : 255.0f;
+		p->v.sequence = g_deathSeq[i];
+		p->v.gaitsequence = 0;
+		p->v.frame = min(frame, 255.0f);
+		p->v.animtime = gpGlobals->time;
+		p->v.framerate = 1.0f;
+	}
+}
+
+// ---- reviver sem item
+// O CoF tem RCP nativo: CBasePlayer::Use no caido faz o vivo se ajoelhar (cpr_down/cpr_idle) e, segurando
+// Usar, chama o StartRevive. Mas o Usar do jogo raramente acha o corpo. Aqui: apertou Usar perto de um
+// amigo caido, olhando para ele, o mod chama esse Use; se o jogo recusar, chama o StartRevive direto.
+static const int OFS_CPR_TARGET = 0x2698; // EHANDLE do caido que o jogador esta reanimando
+static bool g_useLast[33];
+
+static void ReviveUseThink()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* r = PlayerAt(i);
+		bool use = r && IsAlive(r) && (r->v.button & IN_USE);
+		bool pressed = use && !g_useLast[i];
+		g_useLast[i] = use;
+		if (!pressed)
+			continue;
+		g_eng->pfnMakeVectors(r->v.v_angle);
+		Vector fwd = gpGlobals->v_forward;
+		fwd.z = 0;
+		edict_t* best = nullptr;
+		float bestDist = 1e9f;
+		for (int j = 1; j <= gpGlobals->maxClients && j < 33; j++)
+		{
+			edict_t* o = PlayerAt(j);
+			if (j == i || !o || IsAlive(o) || !g_deadSince[j] || o->v.fuser3 == REVIVING)
+				continue;
+			Vector d = o->v.origin - r->v.origin;
+			float dz = fabsf(d.z);
+			d.z = 0;
+			float dist = d.Length();
+			if (dist > 110.0f || dz > 72.0f)
+				continue;
+			if (dist > 40.0f && DotProduct(d * (1.0f / dist), fwd.Normalize()) < 0.5f)
+				continue;
+			if (dist < bestDist)
+				bestDist = dist, best = o;
+		}
+		if (!best)
+			continue;
+		void* rp = r->pvPrivateData;
+		if (Field<edict_t*>(rp, OFS_CPR_TARGET) == best)
+			continue; // o Usar do jogo ja comecou
+		g_orig.pfnUse(best, r);
+		if (Field<edict_t*>(rp, OFS_CPR_TARGET) == best)
+			Log("jogador %d comecou a reanimar o jogador %d (RCP do jogo)", i, g_eng->pfnIndexOfEdict(best));
+		else if (g_StartRevive)
+		{
+			g_StartRevive(best->pvPrivateData);
+			Log("jogador %d levantou o jogador %d (o RCP do jogo recusou)", i, g_eng->pfnIndexOfEdict(best));
+		}
+	}
+}
+static bool g_hinted[33];   // ja avisou que pode pular para renascer
 static bool g_diedHere[33];   // morreu neste mapa (a proxima volta a vida e revive/respawn)
 static bool g_aliveLast[33];
 static Vector g_deathPos[33];
@@ -747,6 +1031,7 @@ static void GiveBackItems(int i)
 	{
 		g_inv[i].pending = true;
 		g_inv[i].restoreAt = 0;
+		g_inv[i].afterDeath = true;
 	}
 	g_seenValid[i] = false; // o ShareThink devolve as chaves do grupo
 }
@@ -808,13 +1093,26 @@ static void RespawnThink()
 			g_diedHere[i] = true;
 			g_deathPos[i] = p->v.origin;
 			g_deadSince[i] = gpGlobals->time;
-			g_eng->pfnClientPrintf(p, print_center, "Espere ser revivido (seringa) ou pule para renascer perto do grupo com seus itens");
+			g_hinted[i] = false;
+			RememberDeathWeapons(i, p->pvPrivateData);
+			StartDeathPose(i, p);
+			char msg[192];
+			_snprintf(msg, sizeof(msg), "Um amigo pode te levantar segurando USAR perto de voce.\nEm %.0f s voce pode pular para renascer perto do grupo.",
+				cv_selfrespawn_time.value);
+			msg[sizeof(msg) - 1] = 0;
+			g_eng->pfnClientPrintf(p, print_center, msg);
 			continue;
 		}
 		if (!g_deadSince[i] || p->v.fuser3 == REVIVING)
 			continue; // sendo revivido: nao interrompe a animacao
 		float waited = gpGlobals->time - g_deadSince[i];
-		bool jump = (p->v.button & IN_JUMP) && waited > 1.5f;
+		bool canJump = waited >= cv_selfrespawn_time.value;
+		if (canJump && !g_hinted[i])
+		{
+			g_hinted[i] = true;
+			g_eng->pfnClientPrintf(p, print_center, "Pule para renascer perto do grupo (com seus itens)");
+		}
+		bool jump = (p->v.button & IN_JUMP) && canJump;
 		bool timeout = cv_respawn_time.value > 0 && waited >= cv_respawn_time.value;
 		if (!jump && !timeout)
 			continue;
@@ -830,6 +1128,10 @@ static void ResetRespawn()
 	memset(g_diedHere, 0, sizeof(g_diedHere));
 	memset(g_aliveLast, 0, sizeof(g_aliveLast));
 	memset(g_resendAt, 0, sizeof(g_resendAt));
+	memset(g_hinted, 0, sizeof(g_hinted));
+	memset(g_useLast, 0, sizeof(g_useLast));
+	for (int i = 0; i < 33; i++)
+		g_deathWeapons[i].clear(); // as entidades morreram com o mapa
 	g_nextSnap = 0;
 }
 
@@ -1826,6 +2128,7 @@ static void Hook_GameInit()
 	g_eng->pfnCVarRegister(&cv_keep_inv);
 	g_eng->pfnCVarRegister(&cv_share_items);
 	g_eng->pfnCVarRegister(&cv_respawn_time);
+	g_eng->pfnCVarRegister(&cv_selfrespawn_time);
 	g_eng->pfnCVarRegister(&cv_model);
 	g_eng->pfnCVarRegister(&cv_start_wait);
 	g_eng->pfnCVarRegister(&cv_start_timeout);
@@ -2119,7 +2422,9 @@ static void Hook_StartFrame()
 	UnstickThink();
 	RestoreThink();
 	ShareThink();
+	ReviveUseThink();
 	RespawnThink();
+	DeathPoseThink();
 	ResendInventoryThink();
 	SnapshotThink();
 }
@@ -2235,6 +2540,16 @@ static void Hook_ClientCommand(edict_t* e)
 	DropCommand(e);
 }
 
+// O jogo renasce o caido no pulo (perdendo as armas). Antes de cofmp_selfrespawn_time o pulo nao chega a ele.
+static void Hook_PlayerPreThink(edict_t* e)
+{
+	int i = g_eng->pfnIndexOfEdict(e);
+	if (cv_enable.value && gpGlobals->maxClients > 1 && i > 0 && i < 33 && g_deadSince[i] && !IsAlive(e) &&
+		gpGlobals->time - g_deadSince[i] < cv_selfrespawn_time.value)
+		e->v.button &= ~IN_JUMP;
+	g_orig.pfnPlayerPreThink(e);
+}
+
 static void Hook_ClientDisconnect(edict_t* e)
 {
 	int i = g_eng->pfnIndexOfEdict(e);
@@ -2291,6 +2606,7 @@ static void BuildTable(DLL_FUNCTIONS* out)
 	out->pfnClientPutInServer = Hook_ClientPutInServer;
 	out->pfnClientConnect = Hook_ClientConnect;
 	out->pfnClientCommand = Hook_ClientCommand;
+	out->pfnPlayerPreThink = Hook_PlayerPreThink;
 	out->pfnTouch = Hook_Touch;
 	out->pfnThink = Hook_Think;
 	InstallDetour();

@@ -18,8 +18,10 @@ Proxy do server DLL (`hl.dll`). O engine carrega `cofmp.dll`, que repassa todos 
 - **Chaves e itens compartilhados:** quando um jogador pega uma chave ou item (`item_key` etc.), todos os jogadores vivos recebem uma cópia, e aparece "X pegou: nome" na tela dos outros. Quando alguém gasta o item numa porta, ele some do inventário de todos. Os itens também vão para o próximo mapa junto com o inventário.
 - **Cutscenes sincronizadas:** quando um `trigger_camera` liga a câmera para um jogador, todos os jogadores vivos veem a mesma câmera (e ficam parados, se o dono ficou). Quando ela desliga, a visão de todos volta. Funciona interceptando o `pfnSetView` da tabela do engine que o `hl.dll` recebe.
 - **Revive, respawn e checkpoints:**
-  - **Revive:** quando um aliado cai, o grupo pode revivê-lo com a seringa (`weapon_syringe`), que é o revive nativo do co-op. Ele levanta no lugar com 30 de vida e recebe de volta o que faltar do inventário.
-  - **Pular:** o jogador caído pode apertar pular para renascer ao lado de um companheiro vivo **com os seus itens**. O aviso do jogo diz "lose weapons", mas o mod devolve tudo.
+  - **Revive:** quando um aliado cai, basta chegar perto dele, olhar para o corpo e segurar USAR. Não precisa de item: o mod chama o RCP nativo do co-op (ou o `StartRevive` direto, se o jogo recusar). A seringa (`weapon_syringe`) continua funcionando. Ele levanta no lugar com 30 de vida e com o inventário de antes.
+  - **Pular:** depois de `cofmp_selfrespawn_time` segundos (padrão 10), o jogador caído pode apertar pular para renascer ao lado de um companheiro vivo **com os seus itens**. O aviso do jogo diz "lose weapons", mas o mod devolve tudo.
+  - **Inventário depois da morte:** a morte zera os slots do inventário e o renascer dá uma pistola nova. O mod refaz os slots exatamente como estavam (mesma posição, então o quick select continua certo) e apaga a pistola extra, para ela não se multiplicar.
+  - **Corpo no chão:** enquanto o jogador está caído, o mod mantém a animação `death`/`crouch_death` andando até o fim.
   - **Tempo limite:** se ninguém reviver, ele renasce assim mesmo depois de `cofmp_respawn_time` segundos (padrão 30).
   - **Todos mortos:** o jogo reinicia o mapa e cada um recebe de volta o inventário da última foto, que a DLL tira a cada segundo.
 

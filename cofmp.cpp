@@ -226,6 +226,8 @@ enum
 	OFS_PLAYER_ITEMS = 0x2514, // CBasePlayerItem* m_rgpPlayerItems[6]
 	OFS_ACTIVE_ITEM = 0x252c,  // CBasePlayerItem* m_pActiveItem
 	OFS_AMMO = 0x2540,         // int m_rgAmmo[32]
+	OFS_INF_STAMINA = 0x21e8,  // bool m_bInfiniteStamina
+	OFS_STAMINA = 0x21f0,      // float m_fStamina
 	OFS_INV_SLOT = 0x21fc,     // string_t inventorySlot[7]
 	OFS_INV_MODEL = 0x2218,    // string_t inventorySlotModels[7]
 	OFS_INV_CLASS = 0x2234,    // string_t inventorySlotClassname[7]
@@ -1970,16 +1972,29 @@ static void ResetGod()
 	memset(g_god, 0, sizeof(g_god));
 }
 
-// ---------------------------------------------------------------- comandos do Home (noclip, god, TP, espectar)
+// ---------------------------------------------------------------- comandos do Home (noclip, god, stamina, TP, espectar)
 //
-// A janela do Home de cada jogador manda "cmd cofmp_admin <noclip|god> <0|1>", "cmd cofmp_admin tp <n>" e
-// "cmd cofmp_admin spec <n>" (0 = parar). Noclip e god continuam ligados na troca de mapa (o engine
+// A janela do Home de cada jogador manda "cmd cofmp_admin <noclip|god|stamina> <0|1>", "cmd cofmp_admin tp <n>"
+// e "cmd cofmp_admin spec <n>" (0 = parar). Noclip, god e stamina continuam ligados na troca de mapa (o engine
 // desconecta e reconecta todos nela, entao so zeram quando um servidor novo abre).
 // Espectar usa o modo "primeira pessoa" do espectador do HL, que o client.dll do CoF ainda tem: iuser1 = 4 e
 // iuser2 = quem e seguido; o corpo de quem espia some, nao colide, nao toma dano e os monstros o ignoram.
 
 static const int OBS_IN_EYE = 4;
-static bool g_adminGod[33], g_noclip[33];
+
+// CBasePlayer (hl.dll): m_bInfiniteStamina e m_fStamina vieram da tabela de save/restore (g_PlayerSaveFields).
+// Com o bool ligado o PreThink nao desconta a stamina ao correr; m_fStamina e o valor que vai para a barra do
+// HUD no user message "Stamina".
+static void SetInfiniteStamina(edict_t* p, bool on)
+{
+	if (!p || !p->pvPrivateData)
+		return;
+	Field<unsigned char>(p->pvPrivateData, OFS_INF_STAMINA) = on ? 1 : 0;
+	if (on)
+		Field<float>(p->pvPrivateData, OFS_STAMINA) = 100.0f;
+}
+
+static bool g_adminGod[33], g_noclip[33], g_infStamina[33];
 static struct
 {
 	int target; // 0 = nao esta espectando
@@ -2109,6 +2124,13 @@ static void AdminCommand(int i, edict_t* p)
 		g_eng->pfnClientPrintf(p, print_center, g_adminGod[i] ? "God mode ligado" : "God mode desligado");
 		Log("jogador %d: god mode %s", i, g_adminGod[i] ? "ligado" : "desligado");
 	}
+	else if (!_stricmp(what, "stamina"))
+	{
+		g_infStamina[i] = n != 0;
+		SetInfiniteStamina(p, g_infStamina[i]);
+		g_eng->pfnClientPrintf(p, print_center, g_infStamina[i] ? "Stamina infinita ligada" : "Stamina infinita desligada");
+		Log("jogador %d: stamina infinita %s", i, g_infStamina[i] ? "ligada" : "desligada");
+	}
 	else if (!_stricmp(what, "tp"))
 		TeleportTo(i, p, n);
 	else if (!_stricmp(what, "spec"))
@@ -2156,6 +2178,7 @@ static void AdminThink()
 			p->v.movetype = MOVETYPE_NOCLIP;
 		if (g_adminGod[i] && !(g_god[i].why & GOD_ADMIN))
 			SetGod(i, GOD_ADMIN, true);
+		SetInfiniteStamina(p, g_infStamina[i]); // respawn/troca de mapa recriam o jogador; reforca todo frame
 	}
 }
 
@@ -2171,6 +2194,7 @@ static void ResetAdmin(bool newServer)
 	{
 		memset(g_adminGod, 0, sizeof(g_adminGod));
 		memset(g_noclip, 0, sizeof(g_noclip));
+		memset(g_infStamina, 0, sizeof(g_infStamina));
 	}
 }
 

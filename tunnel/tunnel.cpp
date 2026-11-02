@@ -38,6 +38,16 @@ public:
 	virtual int GetFriendRelationship(CSteamID) = 0;
 	virtual int GetFriendPersonaState(CSteamID) = 0;
 	virtual const char* GetFriendPersonaName(CSteamID) = 0;
+	virtual bool GetFriendGamePlayed(CSteamID, void* info) = 0;
+};
+
+struct FriendGameInfo_t
+{
+	uint64_t gameID; // os 24 bits de baixo sao o appid
+	uint32_t ip;
+	uint16_t port, queryPort;
+	CSteamID lobby;
+	uint8_t pad[8];
 };
 
 struct P2PSessionState_t
@@ -121,11 +131,7 @@ public:
 class ConnectFail : public CCallbackBase
 {
 public:
-	void Run(void* p) override
-	{
-		printf("  Falha na conexao P2P com %s (erro %d). Confira o codigo e se o outro lado esta com o tunel aberto.\n",
-			Name(*(CSteamID*)p), ((uint8_t*)p)[8]);
-	}
+	void Run(void* p) override;
 	void Run(void* p, bool, uint64_t) override { Run(p); }
 	int GetCallbackSizeBytes() override { return 12; }
 };
@@ -149,16 +155,38 @@ static std::string HelloVersion(const char* data, uint32_t len)
 }
 
 // O jogo (cof.exe) tambem roda como appid 223710 e consome os callbacks da Steam do processo dele, entao o pedido de
-// sessao (P2PSessionRequest) pode nunca chegar aqui. O host aceita por conta propria quem estiver online na lista de amigos.
-static void AcceptFriends()
+// sessao (P2PSessionRequest) pode nunca chegar aqui. O host aceita por conta propria os amigos que estao no Cry of Fear.
+// Sem pedido pendente, o Accept abre uma conexao para o amigo; quem nao responde fica 1 min de fora (g_quiet).
+static std::map<uint64_t, DWORD> g_quiet;
+static std::map<uint64_t, bool> g_greeted; // host: amigos que ja mandaram o "cofmp <versao>"
+
+static void AcceptFriends(DWORD now)
 {
 	int n = g_friends->GetFriendCount(FRIEND_IMMEDIATE);
 	for (int k = 0; k < n; k++)
 	{
 		CSteamID id = g_friends->GetFriendByIndex(k, FRIEND_IMMEDIATE);
-		if (g_friends->GetFriendPersonaState(id) != 0)
+		FriendGameInfo_t game = {};
+		if (g_greeted[id.v] || !g_friends->GetFriendGamePlayed(id, &game) || (game.gameID & 0xFFFFFF) != 223710)
+			continue;
+		auto q = g_quiet.find(id.v);
+		if (q == g_quiet.end() || (int)(now - q->second) >= 0)
 			g_net->AcceptP2PSessionWithUser(id);
 	}
+}
+
+void ConnectFail::Run(void* p)
+{
+	CSteamID id = *(CSteamID*)p;
+	if (g_host && !g_greeted[id.v]) // conexao que o AcceptFriends abriu para um amigo sem o tunel: ignora por 1 min
+	{
+		g_quiet[id.v] = timeGetTime() + 60000;
+		return;
+	}
+	if (!g_host && id.v != g_peer.v)
+		return;
+	printf("  Falha na conexao P2P com %s (erro %d). Confira o codigo e se o outro lado esta com o tunel aberto.\n",
+		Name(id), ((uint8_t*)p)[8]);
 }
 
 static SOCKET UdpSocket(uint16_t port)
@@ -331,7 +359,7 @@ int main(int argc, char** argv)
 	static char buf[65536];
 	DWORD lastCb = 0, lastStatus = 0, lastHello = 0, lastAccept = 0, start = timeGetTime();
 	bool wasRelay = false, announced = false, hostAnswered = false, warned = false;
-	std::map<uint64_t, bool> greeted; // host: amigos que ja mandaram o "cofmp <versao>"
+
 	for (;;)
 	{
 		bool busy = false;
@@ -341,9 +369,9 @@ int main(int argc, char** argv)
 			pRunCallbacks();
 			lastCb = now;
 		}
-		if (g_host && now - lastAccept >= 1000)
+		if (g_host && now - lastAccept >= 2000)
 		{
-			AcceptFriends();
+			AcceptFriends(now);
 			lastAccept = now;
 		}
 
@@ -360,9 +388,9 @@ int main(int argc, char** argv)
 			{
 				g_net->AcceptP2PSessionWithUser(from);
 				SendHello(from);
-				if (!greeted[from.v])
+				if (!g_greeted[from.v])
 				{
-					greeted[from.v] = true;
+					g_greeted[from.v] = true;
 					printf("  %s abriu o tunel para entrar (v%s).\n", Name(from), ver.c_str());
 					if (ver != COFMP_VERSION)
 						printf("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);

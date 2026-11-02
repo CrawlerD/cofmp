@@ -32,7 +32,7 @@ static DWORD g_codeStart;
 static HFONT g_font, g_bold;
 
 enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS, ID_GO, ID_CHANGE, ID_SHOW_SIMON,
-	ID_SHOW_COPS, ID_SHOW_COMMUNITY, ID_NOCLIP, ID_GOD, ID_TARGET, ID_TP, ID_SPEC, ID_SPEC_STOP, ID_SAVE, ID_SAVES,
+	ID_SHOW_COPS, ID_SHOW_COMMUNITY, ID_NOCLIP, ID_GOD, ID_AMMO, ID_STAMINA, ID_TARGET, ID_TP, ID_SPEC, ID_SPEC_STOP, ID_SAVE, ID_SAVES,
 	ID_LOAD };
 enum { WM_HUD_CMD = WM_APP + 0x43 };
 enum { TIMER_POLL = 1, TIMER_CODE, TIMER_CONNECT, TIMER_SAVES };
@@ -821,10 +821,11 @@ static void Poll()
 	CoopPanelThink();
 	CmdHooksThink();
 	SaveInfoThink();
-	if (!g_inMP && (IsDlgButtonChecked(g_hud, ID_NOCLIP) || IsDlgButtonChecked(g_hud, ID_GOD)))
+	if (!g_inMP && (IsDlgButtonChecked(g_hud, ID_NOCLIP) || IsDlgButtonChecked(g_hud, ID_GOD) ||
+		IsDlgButtonChecked(g_hud, ID_AMMO) || IsDlgButtonChecked(g_hud, ID_STAMINA)))
 	{
-		CheckDlgButton(g_hud, ID_NOCLIP, BST_UNCHECKED); // saiu do jogo: o servidor novo comeca sem eles
-		CheckDlgButton(g_hud, ID_GOD, BST_UNCHECKED);
+		for (int id : { ID_NOCLIP, ID_GOD, ID_AMMO, ID_STAMINA }) // saiu do jogo: o servidor novo comeca sem eles
+			CheckDlgButton(g_hud, id, BST_UNCHECKED);
 	}
 	AttachGame();
 	SteamThink();
@@ -896,7 +897,10 @@ static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			break;
 		case ID_NOCLIP:
 		case ID_GOD:
-			AdminCmd(LOWORD(w) == ID_NOCLIP ? "noclip" : "god", IsDlgButtonChecked(h, LOWORD(w)) == BST_CHECKED);
+		case ID_AMMO:
+		case ID_STAMINA:
+			AdminCmd(LOWORD(w) == ID_NOCLIP ? "noclip" : LOWORD(w) == ID_GOD ? "god" : LOWORD(w) == ID_AMMO ? "ammo" : "stamina",
+				IsDlgButtonChecked(h, LOWORD(w)) == BST_CHECKED);
 			break;
 		case ID_TARGET:
 			if (HIWORD(w) == CBN_DROPDOWN)
@@ -1122,13 +1126,15 @@ static void CreateHud()
 
 	// painel da partida em andamento: vale para quem esta dentro de um jogo co-op (host ou convidado)
 	Ctl(L"BUTTON", L"Comandos", BS_GROUPBOX, 380, 40, 240, 156, 0);
-	Ctl(L"BUTTON", L"Noclip", C, 392, 62, 100, 20, ID_NOCLIP);
-	Ctl(L"BUTTON", L"God mode", C, 500, 62, 108, 20, ID_GOD);
-	Ctl(L"STATIC", L"Jogador:", SC, 392, 92, 55, 23, 0);
-	Ctl(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 450, 92, 158, 200, ID_TARGET);
-	Ctl(L"BUTTON", L"Teleportar até ele", B, 392, 122, 216, 28, ID_TP);
-	Ctl(L"BUTTON", L"Espectar", B, 392, 158, 104, 26, ID_SPEC);
-	Ctl(L"BUTTON", L"Parar", B, 504, 158, 104, 26, ID_SPEC_STOP);
+	Ctl(L"BUTTON", L"Noclip", C, 392, 58, 100, 20, ID_NOCLIP);
+	Ctl(L"BUTTON", L"God mode", C, 500, 58, 108, 20, ID_GOD);
+	Ctl(L"BUTTON", L"Munição infinita", C, 392, 80, 106, 20, ID_AMMO);
+	Ctl(L"BUTTON", L"Estamina infinita", C, 500, 80, 112, 20, ID_STAMINA);
+	Ctl(L"STATIC", L"Jogador:", SC, 392, 105, 55, 23, 0);
+	Ctl(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 450, 105, 158, 200, ID_TARGET);
+	Ctl(L"BUTTON", L"Teleportar até ele", B, 392, 133, 216, 26, ID_TP);
+	Ctl(L"BUTTON", L"Espectar", B, 392, 164, 104, 24, ID_SPEC);
+	Ctl(L"BUTTON", L"Parar", B, 504, 164, 104, 24, ID_SPEC_STOP);
 
 	Ctl(L"BUTTON", L"Partida salva", BS_GROUPBOX, 380, 206, 240, 100, 0);
 	Ctl(L"BUTTON", L"Salvar agora", B, 392, 226, 216, 23, ID_SAVE);

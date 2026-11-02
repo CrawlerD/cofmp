@@ -140,7 +140,20 @@ static bool HullFree(const Vector& pos, edict_t* skip)
 {
 	TraceResult tr;
 	g_eng->pfnTraceHull(pos, pos, 0, 1 /* human_hull */, skip, &tr);
-	return !tr.fStartSolid && !tr.fAllSolid;
+	if (tr.fStartSolid || tr.fAllSolid)
+		return false;
+	// o trace nem sempre ve outro jogador (o segundo chegou em cima do primeiro no c_start2)
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = g_eng->pfnPEntityOfEntIndex(k);
+		if (IsNull(o) || o == skip || !(o->v.flags & FL_CLIENT) || !o->pvPrivateData || !IsAlive(o) ||
+			o->v.solid == SOLID_NOT || o->v.iuser1) // quem espia tem o corpo junto do seguido
+			continue;
+		Vector d = o->v.origin - pos;
+		if (fabsf(d.x) < 33 && fabsf(d.y) < 33 && fabsf(d.z) < 73)
+			return false;
+	}
+	return true;
 }
 
 // Procura um ponto livre perto de pos (anel de deslocamentos); false se nao achar.
@@ -187,6 +200,7 @@ static struct
 
 static bool g_changing; // ja pedimos changelevel neste mapa
 static void StopSkip(const char* why);
+static float g_skipEndAt = -1000; // quando o ultimo pulo de cutscene acabou
 static bool g_tracing; // ha entidades de um inventorydrop sendo seguidas (rastreio de itens)
 static void TraceCheck(const char* during);
 
@@ -1330,6 +1344,165 @@ static void __fastcall Hook_ChangeLevelNow(void* self, void* /*edx*/, void* pAct
 	}
 }
 
+// ---------------------------------------------------------------- jogador "atual"
+//
+// Muitas coisas do CoF agem no "primeiro jogador" (UTIL_FindEntityByClassname(NULL, "player")), que no MP e sempre o
+// host: o padlockrotate do convidado girava o cadeado do host e travava os dois (o mesmo vale para o computador, o
+// telefone, o telescopio...). O hl.dll recebe pfnFindEntityByString trocado: enquanto o servidor processa algo de um
+// jogador (comando, think, toque), a busca por "player" devolve ele primeiro e os outros depois.
+static edict_t* g_actor;
+static edict_t* g_ownView[33]; // visao de um jogador so (cadeado, zoom, telescopio...), fora das cutscenes
+
+struct ActorScope
+{
+	edict_t* old;
+	explicit ActorScope(edict_t* e) : old(g_actor)
+	{
+		if (e && (e->v.flags & FL_CLIENT) && cv_enable.value && gpGlobals->maxClients > 1)
+			g_actor = e;
+	}
+	~ActorScope() { g_actor = old; }
+};
+
+static edict_t* Hook_FindEntityByString(edict_t* start, const char* field, const char* value)
+{
+	edict_t* a = g_actor;
+	if (!a || a->free || !field || !value || strcmp(field, "classname") || strcmp(value, "player"))
+		return g_eng->pfnFindEntityByString(start, field, value);
+	if (IsNull(start))
+		return a;
+	edict_t* e = g_eng->pfnFindEntityByString(start == a ? NULL : start, field, value);
+	if (e == a)
+		e = g_eng->pfnFindEntityByString(e, field, value);
+	return e;
+}
+
+// ---------------------------------------------------------------- objetivo e notas para todos
+//
+// O cof_objective grava o objetivo so no primeiro jogador (o host): o convidado nunca via. Cada jogador recebe o
+// mesmo (o jogador manda a mensagem Objectives sozinho quando o texto muda). As notas (documentos lidos, codigos)
+// ficam num vetor de 16 entradas em cada jogador: o que um pega e copiado para os outros e mandado ao cliente
+// com a mesma mensagem AddNote que o jogo usa ao reenviar a lista.
+
+static const int OFS_OBJ_TARGET = 0x420, OFS_OBJ_MSG = 0x1e90; // string_t
+static const int EV_TARGET = 0x1cc, EV_MESSAGE = 0x1d8;         // entvars_t
+static bool g_objSet;
+static int g_objTarget, g_objMsg;
+
+static void ObjectiveThink()
+{
+	if (!g_objSet)
+		return;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT))
+			continue;
+		void* pl = p->pvPrivateData;
+		if (Field<int>(pl, OFS_OBJ_MSG) == g_objMsg && (!g_objTarget || Field<int>(pl, OFS_OBJ_TARGET) == g_objTarget))
+			continue;
+		if (g_objTarget)
+			Field<int>(pl, OFS_OBJ_TARGET) = g_objTarget;
+		Field<int>(pl, OFS_OBJ_MSG) = g_objMsg;
+	}
+}
+
+static const int NOTE_BASE = 0x688, NOTE_SIZE = 0x120, NOTE_MAX = 16; // entrada n (1..16) em NOTE_BASE + n*NOTE_SIZE
+static const int RVA_MSG_ADDNOTE = 0x226648;                         // int gmsgAddNote
+static const int MSG_ONE_ = 1;
+// campos de texto de uma entrada, na ordem da mensagem AddNote (o primeiro diz se a entrada esta em uso)
+static const struct { int ofs, size; } g_noteFields[] = {
+	{ 0x40, 16 }, { 0x50, 16 }, { 0x60, 16 }, { 0x70, 16 }, { 0x00, 16 }, { 0x10, 16 },
+	{ 0x20, 16 }, { 0x30, 16 }, { 0x80, 0x30 }, { 0xb0, 0x40 }, { 0xf0, 0x30 },
+};
+
+static BYTE* NoteAt(void* pl, int n)
+{
+	return (BYTE*)pl + NOTE_BASE + n * NOTE_SIZE;
+}
+
+static bool SameNote(const BYTE* a, const BYTE* b)
+{
+	for (const auto& f : g_noteFields)
+		if (strncmp((const char*)a + f.ofs, (const char*)b + f.ofs, f.size))
+			return false;
+	return true;
+}
+
+static bool HasNote(void* pl, const BYTE* note)
+{
+	for (int n = 1; n <= NOTE_MAX; n++)
+		if (NoteAt(pl, n)[0x40] && SameNote(NoteAt(pl, n), note))
+			return true;
+	return false;
+}
+
+static void SendNote(edict_t* p, int n)
+{
+	int msg = *(int*)((BYTE*)g_hl + RVA_MSG_ADDNOTE);
+	if (msg <= 0)
+		return;
+	const BYTE* e = NoteAt(p->pvPrivateData, n);
+	g_eng->pfnMessageBegin(MSG_ONE_, msg, NULL, p);
+	g_eng->pfnWriteByte(n);
+	g_eng->pfnWriteByte(0);
+	g_eng->pfnWriteShort(0);
+	g_eng->pfnWriteByte(0);
+	for (const auto& f : g_noteFields)
+	{
+		char s[0x41];
+		memcpy(s, e + f.ofs, f.size);
+		s[f.size] = 0;
+		g_eng->pfnWriteString(s);
+	}
+	g_eng->pfnMessageEnd();
+}
+
+static void NotesThink()
+{
+	static float next;
+	if (gpGlobals->time < next && next - gpGlobals->time < 1.0f)
+		return;
+	next = gpGlobals->time + 0.5f;
+	for (int a = 1; a <= gpGlobals->maxClients && a < 33; a++)
+	{
+		edict_t* pa = PlayerAt(a);
+		if (!pa || (pa->v.flags & FL_FAKECLIENT))
+			continue;
+		for (int n = 1; n <= NOTE_MAX; n++)
+		{
+			const BYTE* note = NoteAt(pa->pvPrivateData, n);
+			if (!note[0x40])
+				continue;
+			for (int b = 1; b <= gpGlobals->maxClients && b < 33; b++)
+			{
+				edict_t* pb = PlayerAt(b);
+				if (b == a || !pb || !IsAlive(pb) || (pb->v.flags & FL_FAKECLIENT) || HasNote(pb->pvPrivateData, note))
+					continue;
+				int m = 1;
+				while (m <= NOTE_MAX && NoteAt(pb->pvPrivateData, m)[0x40])
+					m++;
+				if (m > NOTE_MAX)
+					continue;
+				memcpy(NoteAt(pb->pvPrivateData, m), note, NOTE_SIZE);
+				SendNote(pb, m);
+				char msg[128];
+				_snprintf(msg, sizeof(msg), "Nota nova nas suas notas (achada por %s)", STRING(pa->v.netname));
+				msg[sizeof(msg) - 1] = 0;
+				g_eng->pfnClientPrintf(pb, print_center, msg);
+				Log("nota %d do jogador %d ('%.16s') copiada para o jogador %d (entrada %d)", n, a,
+					(const char*)note + 0x40, b, m);
+			}
+		}
+	}
+}
+
+// inventorydualwield: o ClientCommand do hl.dll ignora no MP; chamamos o metodo do jogador direto
+typedef void(__thiscall* DualWield_t)(void* player, int a, int b);
+static DualWield_t g_DualWield;
+static const DWORD RVA_DualWield = 0xde990;
+static const BYTE SIG_DualWield[] = { 0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x1C, 0x01, 0x00, 0x00 };
+
 static const DWORD RVA_ChangeLevelNow = 0x109d40;
 static const BYTE SIG_ChangeLevelNow[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x53, 0x8B, 0xD9 };
 static const int STOLEN = 6; // push ebp / mov ebp,esp / sub esp,8
@@ -1340,7 +1513,7 @@ static const int STOLEN = 6; // push ebp / mov ebp,esp / sub esp,8
 // vivo, como se ele tambem tivesse disparado.
 typedef void(__thiscall* Use_t)(void* self, void* pActivator, void* pCaller, int useType, float value);
 static const int VT_USE = 58;
-enum { EACH_TELEPORT, EACH_CLEARITEMS, EACH_GIVEITEMS, EACH_COUNT };
+enum { EACH_TELEPORT, EACH_CLEARITEMS, EACH_GIVEITEMS, EACH_OBJECTIVE, EACH_COUNT };
 static struct
 {
 	const char* cls;
@@ -1350,6 +1523,7 @@ static struct
 	{ "cof_teleport", 0x1c5b50, 0xa7990 },
 	{ "cof_clearitems", 0x1c3cd0, 0xa60c0 },
 	{ "cof_giveitems", 0x1c49b4, 0xa6bc0 },
+	{ "cof_objective", 0x1c985c, 0xa4b00 },
 };
 
 static void UseForEach(int k, void* self, void* pActivator, void* pCaller, int useType, float value)
@@ -1390,6 +1564,20 @@ static void __fastcall Hook_GiveItemsUse(void* self, void*, void* pActivator, vo
 		g_each[EACH_GIVEITEMS].orig(self, pActivator, pCaller, useType, value);
 	else
 		UseForEach(EACH_GIVEITEMS, self, pActivator, pCaller, useType, value);
+}
+
+static void __fastcall Hook_ObjectiveUse(void* self, void*, void* pActivator, void* pCaller, int useType, float value)
+{
+	g_each[EACH_OBJECTIVE].orig(self, pActivator, pCaller, useType, value);
+	if (gpGlobals->maxClients <= 1 || !cv_enable.value)
+		return;
+	BYTE* pev = *(BYTE**)((BYTE*)self + 4);
+	if (*(int*)(pev + EV_TARGET))
+		g_objTarget = *(int*)(pev + EV_TARGET);
+	g_objMsg = *(int*)(pev + EV_MESSAGE);
+	g_objSet = true;
+	ObjectiveThink();
+	Log("objetivo '%s' para todos os jogadores", g_objTarget ? STRING(g_objTarget) : "");
 }
 
 static void InstallDetour()
@@ -1437,7 +1625,14 @@ static void InstallDetour()
 	else
 		Log("aviso: assinatura de SendInvSlot nao confere - inventario pode sumir da tela ao renascer");
 
-	void* hooks[EACH_COUNT] = { (void*)&Hook_TeleportUse, (void*)&Hook_ClearItemsUse, (void*)&Hook_GiveItemsUse };
+	BYTE* dw = (BYTE*)g_hl + RVA_DualWield;
+	if (!memcmp(dw, SIG_DualWield, sizeof(SIG_DualWield)))
+		g_DualWield = (DualWield_t)dw;
+	else
+		Log("aviso: assinatura de DualWield nao confere - empunhar duas armas fica como o jogo deixa no MP");
+
+	void* hooks[EACH_COUNT] = { (void*)&Hook_TeleportUse, (void*)&Hook_ClearItemsUse, (void*)&Hook_GiveItemsUse,
+		(void*)&Hook_ObjectiveUse };
 	for (int k = 0; k < EACH_COUNT; k++)
 	{
 		void** vt = (void**)((BYTE*)g_hl + g_each[k].vt);
@@ -1530,9 +1725,11 @@ static void Cmd_Debug()
 		edict_t* e = g_eng->pfnPEntityOfEntIndex(i);
 		if (!e)
 			continue;
-		Log("slot %d: free %d flags 0x%x priv %p iuser1 %d health %.0f dead %d origin %.0f %.0f %.0f", i, e->free,
-			e->v.flags, e->pvPrivateData, e->v.iuser1, e->v.health, e->v.deadflag, e->v.origin.x, e->v.origin.y,
-			e->v.origin.z);
+		Log("slot %d: free %d flags 0x%x priv %p iuser1 %d health %.0f dead %d origin %.0f %.0f %.0f | modelo '%s' (%d) "
+			"effects 0x%x render %d/%d/%d solid %d movetype %d", i, e->free, e->v.flags, e->pvPrivateData,
+			e->v.iuser1, e->v.health, e->v.deadflag, e->v.origin.x, e->v.origin.y, e->v.origin.z,
+			e->v.model ? STRING(e->v.model) : "", e->v.modelindex, e->v.effects, e->v.rendermode, (int)e->v.renderamt,
+			e->v.renderfx, e->v.solid, e->v.movetype);
 	}
 }
 
@@ -1904,7 +2101,8 @@ static bool IsTriggerEnt(edict_t* e)
 // Motivos para um jogador nao tomar dano (esperando o grupo para uma cutscene, camera ligada). Enquanto houver
 // algum, takedamage fica DAMAGE_NO, FL_GODMODE ligado e a vida nao cai; quando o ultimo sai, volta como estava.
 
-enum { GOD_WAIT = 1, GOD_CAM = 2, GOD_ADMIN = 4, GOD_SPEC = 8 }; // ADMIN: god mode do Home; SPEC: espectando
+enum { GOD_WAIT = 1, GOD_CAM = 2, GOD_ADMIN = 4, GOD_SPEC = 8, GOD_SKIP = 16 }; // ADMIN: god mode do Home; SPEC: espectando;
+                                                                              // SKIP: cena pulada sem camera
 static struct
 {
 	int why;
@@ -1931,7 +2129,7 @@ static void SetGod(int i, int why, bool on)
 		p->v.takedamage = DAMAGE_NO;
 		p->v.flags |= FL_GODMODE;
 		Note("jogador %d imortal (%s)", i,
-			why == GOD_WAIT ? "esperando o grupo" : why == GOD_CAM ? "cutscene" : why == GOD_ADMIN ? "god mode" : "espectando");
+			why == GOD_WAIT ? "esperando o grupo" : why == GOD_CAM ? "cutscene" : why == GOD_ADMIN ? "god mode" : why == GOD_SPEC ? "espectando" : "cena pulada");
 	}
 	else if (before && !g_god[i].why)
 	{
@@ -1973,13 +2171,15 @@ static void ResetGod()
 // ---------------------------------------------------------------- comandos do Home (noclip, god, TP, espectar)
 //
 // A janela do Home de cada jogador manda "cmd cofmp_admin <noclip|god> <0|1>", "cmd cofmp_admin tp <n>" e
-// "cmd cofmp_admin spec <n>" (0 = parar). Noclip e god continuam ligados na troca de mapa (o engine
+// "cmd cofmp_admin spec <n>" (0 = parar), "cmd cofmp_admin ammo <0|1>" e "cmd cofmp_admin stamina <0|1>". Noclip e god continuam ligados na troca de mapa (o engine
 // desconecta e reconecta todos nela, entao so zeram quando um servidor novo abre).
 // Espectar usa o modo "primeira pessoa" do espectador do HL, que o client.dll do CoF ainda tem: iuser1 = 4 e
 // iuser2 = quem e seguido; o corpo de quem espia some, nao colide, nao toma dano e os monstros o ignoram.
 
 static const int OBS_IN_EYE = 4;
-static bool g_adminGod[33], g_noclip[33];
+static bool g_adminGod[33], g_noclip[33], g_infAmmo[33], g_infStamina[33];
+static std::unordered_map<void*, int> g_ammoMax; // municao infinita: o maior pente visto em cada arma
+static const int OFS_STAMINA = 0x21f0; // float, 0..100
 static struct
 {
 	int target; // 0 = nao esta espectando
@@ -2109,6 +2309,14 @@ static void AdminCommand(int i, edict_t* p)
 		g_eng->pfnClientPrintf(p, print_center, g_adminGod[i] ? "God mode ligado" : "God mode desligado");
 		Log("jogador %d: god mode %s", i, g_adminGod[i] ? "ligado" : "desligado");
 	}
+	else if (!_stricmp(what, "ammo") || !_stricmp(what, "stamina"))
+	{
+		bool ammo = !_stricmp(what, "ammo");
+		(ammo ? g_infAmmo : g_infStamina)[i] = n != 0;
+		g_eng->pfnClientPrintf(p, print_center, ammo ? (n ? "Municao infinita ligada" : "Municao infinita desligada")
+			: (n ? "Estamina infinita ligada" : "Estamina infinita desligada"));
+		Log("jogador %d: %s infinita %s", i, ammo ? "municao" : "estamina", n ? "ligada" : "desligada");
+	}
 	else if (!_stricmp(what, "tp"))
 		TeleportTo(i, p, n);
 	else if (!_stricmp(what, "spec"))
@@ -2156,6 +2364,21 @@ static void AdminThink()
 			p->v.movetype = MOVETYPE_NOCLIP;
 		if (g_adminGod[i] && !(g_god[i].why & GOD_ADMIN))
 			SetGod(i, GOD_ADMIN, true);
+		void* pl = p->pvPrivateData;
+		if (g_infStamina[i] && Field<float>(pl, OFS_STAMINA) < 100)
+			Field<float>(pl, OFS_STAMINA) = 100;
+		void* it = Field<void*>(pl, OFS_ACTIVE_ITEM);
+		if (g_infAmmo[i] && it && PevOf(it))
+		{
+			int& clip = Field<int>(it, OFS_ITEM_CLIP);
+			auto f = g_ammoMax.find(it);
+			if (clip < 0) // arma branca
+				;
+			else if (f == g_ammoMax.end() || clip > f->second)
+				g_ammoMax[it] = clip;
+			else if (clip < f->second)
+				clip = f->second;
+		}
 	}
 }
 
@@ -2171,7 +2394,10 @@ static void ResetAdmin(bool newServer)
 	{
 		memset(g_adminGod, 0, sizeof(g_adminGod));
 		memset(g_noclip, 0, sizeof(g_noclip));
+		memset(g_infAmmo, 0, sizeof(g_infAmmo));
+		memset(g_infStamina, 0, sizeof(g_infStamina));
 	}
+	g_ammoMax.clear(); // as armas do mapa velho nao existem mais
 }
 
 // ---------------------------------------------------------------- pausa so com todos no menu
@@ -2528,6 +2754,7 @@ static bool PickupTouch(edict_t* item, edict_t* player);
 
 static void Hook_Touch(edict_t* touched, edict_t* other)
 {
+	ActorScope actor(IsPlayer(other) ? other : IsPlayer(touched) ? touched : NULL);
 	if (cv_touchlog.value && IsTriggerEnt(touched) && !IsNull(other) && (other->v.flags & FL_CLIENT))
 	{
 		static float next[2048];
@@ -2650,6 +2877,7 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	g_orig.pfnServerActivate(list, count, clientMax);
 
 	StopSkip("mapa novo");
+	g_skipEndAt = -1000; // o relogio recomeca no mapa novo
 	ResetTrace();
 	g_netReset = true; // o carregamento do mapa nao conta como travada
 	g_changing = false;
@@ -2661,6 +2889,8 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	ResetKeyring();
 	ResetCutscene();
 	ResetGod();
+	g_objSet = false; // os string_t do mapa anterior nao valem mais
+	g_objTarget = g_objMsg = 0;
 	memset(&g_cut, 0, sizeof(g_cut));
 	FindCutsceneTriggers();
 
@@ -2897,6 +3127,8 @@ static void Hook_StartFrame()
 	DeathPoseThink();
 	ResendInventoryThink();
 	SnapshotThink();
+	ObjectiveThink();
+	NotesThink();
 }
 
 // ---------------------------------------------------------------- modelo do jogador
@@ -2945,6 +3177,11 @@ static void Hook_ClientUserInfoChanged(edict_t* e, char* info)
 static void Hook_ClientPutInServer(edict_t* e)
 {
 	g_orig.pfnClientPutInServer(e);
+	// O engine guarda a visao de cada cliente como ponteiro e nao a zera na troca de mapa: quem saiu de um mapa
+	// depois de uma camera chegava ao proximo olhando (para o engine) de um edict do mapa antigo. O PVS saia de
+	// la e os outros jogadores nao eram mandados - ficavam invisiveis ate morrer e renascer (c_start2).
+	if (cv_enable.value && gpGlobals->maxClients > 1)
+		g_eng->pfnSetView(e, e);
 	ForceModel(e, g_eng->pfnGetInfoKeyBuffer(e));
 	Log("jogador %d '%s' entrou no mapa", g_eng->pfnIndexOfEdict(e), STRING(e->v.netname));
 	WatchBeat();
@@ -3016,6 +3253,13 @@ static void Hook_ClientCommand(edict_t* e)
 		if (seen[i].size() > 500)
 			seen[i].clear();
 	}
+	ActorScope actor(e);
+	if (i > 0 && i < 33 && g_DualWield && e->pvPrivateData && cv_enable.value && gpGlobals->maxClients > 1 &&
+		!strcmp(name, "inventorydualwield"))
+	{
+		g_DualWield(e->pvPrivateData, atoi(g_eng->pfnCmd_Argv(1)), atoi(g_eng->pfnCmd_Argv(2)));
+		return;
+	}
 	if (!drop)
 	{
 		g_orig.pfnClientCommand(e);
@@ -3033,7 +3277,14 @@ static void Hook_PlayerPreThink(edict_t* e)
 	if (cv_enable.value && gpGlobals->maxClients > 1 && i > 0 && i < 33 && g_deadSince[i] && !IsAlive(e) &&
 		gpGlobals->time - g_deadSince[i] < cv_selfrespawn_time.value)
 		e->v.button &= ~IN_JUMP;
+	ActorScope actor(e);
 	g_orig.pfnPlayerPreThink(e);
+}
+
+static void Hook_PlayerPostThink(edict_t* e)
+{
+	ActorScope actor(e);
+	g_orig.pfnPlayerPostThink(e);
 }
 
 static void Hook_ClientDisconnect(edict_t* e)
@@ -3052,6 +3303,7 @@ static void Hook_ClientDisconnect(edict_t* e)
 		g_aliveLast[i] = false;
 		if (g_camOwner == i)
 			Hook_SetView(e, e); // devolve a visao dos outros
+		g_ownView[i] = NULL;
 		g_hold.frozen[i] = false;
 		g_cut.waiting[i] = false;
 		g_cut.frozen[i] = false;
@@ -3100,6 +3352,7 @@ static void BuildTable(DLL_FUNCTIONS* out)
 	out->pfnClientConnect = Hook_ClientConnect;
 	out->pfnClientCommand = Hook_ClientCommand;
 	out->pfnPlayerPreThink = Hook_PlayerPreThink;
+	out->pfnPlayerPostThink = Hook_PlayerPostThink;
 	out->pfnTouch = Hook_Touch;
 	out->pfnThink = Hook_Think;
 	InstallDetour();
@@ -3123,6 +3376,14 @@ static void Hook_SetView(const edict_t* client, const edict_t* view)
 	if (!cv_enable.value || i < 1 || i > gpGlobals->maxClients || i >= 33 || gpGlobals->maxClients <= 1 || g_changing)
 		return;
 	bool on = view != client;
+	// so a camera de cutscene e de todos; as outras visoes (cadeado, zoom, telescopio, a camera de fotos) sao so de
+	// quem usa: o cadeado aparecia para os dois e o convidado ficava preso nele
+	g_ownView[i] = NULL;
+	if (on && _stricmp(STRING(view->v.classname), "trigger_camera"))
+	{
+		g_ownView[i] = (edict_t*)view;
+		return;
+	}
 	if (on && (!g_camOwner || g_camOwner == i))
 	{
 		g_camOwner = i;
@@ -3191,6 +3452,7 @@ static void ResetCutscene()
 	g_camOwner = 0;
 	g_camView = NULL;
 	memset(g_camShared, 0, sizeof(g_camShared));
+	memset(g_ownView, 0, sizeof(g_ownView));
 }
 
 // ---------------------------------------------------------------- pular cutscene (Enter)
@@ -3208,6 +3470,13 @@ static const char SIG_FILTER_SP_CHECK[] = "\x85\xC0\x75\x09\x83\x3D????\x00\x74\
 static const float SKIP_FRAMERATE = 2.0f; // o valor que o client.dll usa no SP
 static const int SF_CAMERA_NOSKIP = 0x400;
 static bool g_skipping;
+// Depois da ultima camera o mapa ainda pode seguir sozinho (fade, falas, relays com delay) ate trocar de mapa: no
+// c_intro foram ~35 s parados num limbo. Enter sem camera logo depois de um pulo acelera esse resto tambem, com
+// todos imortais, ate o mapa trocar ou o tempo acabar.
+static const float FREE_SKIP_AFTER = 90;  // s depois do fim do pulo em que Enter ainda vale
+static const float FREE_SKIP_TIME = 60;   // s de jogo acelerados (com host_framerate 2 sao 30 frames)
+static bool g_freeSkip;
+static float g_freeSkipUntil;
 
 static bool AllowFramerateInMP(bool on)
 {
@@ -3242,6 +3511,13 @@ static void StopSkip(const char* why)
 	g_skipping = false;
 	g_eng->pfnCVarSetFloat("host_framerate", 0);
 	AllowFramerateInMP(false);
+	g_skipEndAt = gpGlobals->time;
+	if (g_freeSkip)
+	{
+		g_freeSkip = false;
+		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+			SetGod(k, GOD_SKIP, false);
+	}
 	Log("cutscene: fim do pulo (%s)", why);
 }
 
@@ -3252,7 +3528,24 @@ static void RequestSkip(int i)
 		return;
 	if (!g_camOwner || IsNull(g_camView))
 	{
-		Note("jogador %d apertou Enter sem cutscene", i);
+		float since = gpGlobals->time - g_skipEndAt;
+		if (since < 0 || since > FREE_SKIP_AFTER || !AllowFramerateInMP(true))
+		{
+			Note("jogador %d apertou Enter sem cutscene", i);
+			return;
+		}
+		g_skipping = g_freeSkip = true;
+		g_freeSkipUntil = gpGlobals->time + FREE_SKIP_TIME;
+		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+		{
+			edict_t* o = PlayerAt(k);
+			if (!o || (o->v.flags & FL_FAKECLIENT))
+				continue;
+			SetGod(k, GOD_SKIP, true);
+			g_eng->pfnClientPrintf(o, print_center, "Pulando o resto da cena...");
+		}
+		g_eng->pfnCVarSetFloat("host_framerate", SKIP_FRAMERATE);
+		Log("cutscene: '%s' pulou o resto da cena sem camera (ate %.0f s de jogo)", STRING(p->v.netname), FREE_SKIP_TIME);
 		return;
 	}
 	if (g_camView->v.spawnflags & SF_CAMERA_NOSKIP)
@@ -3270,7 +3563,12 @@ static void RequestSkip(int i)
 // Cameras encadeadas desligam e ligam no mesmo frame: o pulo segue ate nao sobrar camera.
 static void SkipThink()
 {
-	if (g_skipping && !g_camOwner)
+	if (g_skipping && g_freeSkip)
+	{
+		if (gpGlobals->time >= g_freeSkipUntil)
+			StopSkip("tempo do pulo sem camera acabou");
+	}
+	else if (g_skipping && !g_camOwner)
 		StopSkip("camera desligou");
 }
 
@@ -3779,7 +4077,7 @@ static void ViewFixThink()
 	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
 	{
 		edict_t* p = PlayerAt(i);
-		if (!p || (p->v.flags & FL_FAKECLIENT))
+		if (!p || (p->v.flags & FL_FAKECLIENT) || (g_ownView[i] && !g_ownView[i]->free))
 			continue;
 		int& view = Field<int>(p->pvPrivateData, OFS_VIEW_ENTITY);
 		if (!view || view == i)
@@ -4570,6 +4868,7 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	g_engForHL.pfnCreateEntity = Hook_CreateEntity;
 	g_engForHL.pfnCreateNamedEntity = Hook_CreateNamedEntity;
 	g_engForHL.pfnRemoveEntity = Hook_RemoveEntity;
+	g_engForHL.pfnFindEntityByString = Hook_FindEntityByString;
 	typedef void(__stdcall * fn_t)(enginefuncs_t*, globalvars_t*);
 	((fn_t)GetProcAddress(g_hl, "GiveFnptrsToDll"))(&g_engForHL, globals);
 }

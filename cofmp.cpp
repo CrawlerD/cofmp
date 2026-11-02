@@ -653,6 +653,47 @@ typedef void(__thiscall* StartRevive_t)(void* player);
 static StartRevive_t g_StartRevive;
 static const DWORD RVA_StartRevive = 0xf1860;
 static const BYTE SIG_StartRevive[] = { 0x56, 0x8B, 0xF1, 0x57, 0xC6, 0x86, 0x0C, 0x05, 0x00, 0x00, 0x00, 0xC7 };
+
+// Sai da camera em 3a pessoa da morte (manda ThirdPerson 0 e zera a flag), como o fim do revive faz.
+typedef void(__thiscall* ExitThirdPerson_t)(void* player);
+static ExitThirdPerson_t g_ExitThirdPerson;
+static const DWORD RVA_ExitThirdPerson = 0xf67f0;
+static const BYTE SIG_ExitThirdPerson[] = { 0x56, 0x8B, 0xF1, 0x8B, 0x46, 0x04, 0xFF, 0xB0, 0x0C, 0x02, 0x00, 0x00 };
+
+// Manda ao cliente o conteudo de um slot do inventario (o terceiro argumento nao e usado).
+typedef void(__thiscall* SendInvSlot_t)(void* player, int slot, int file, int unused);
+static SendInvSlot_t g_SendInvSlot;
+static const DWORD RVA_SendInvSlot = 0xe4360;
+static const BYTE SIG_SendInvSlot[] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0xF1, 0x33, 0xDB, 0x8B, 0x46, 0x04 };
+static float g_resendAt[33];
+
+// O Spawn limpa a tela de inventario do cliente, mas os slots continuam no servidor: so a arma na mao
+// voltava. Reenvia cada slot (depois do ResetHUD do spawn) e tira a camera da 3a pessoa.
+static void ResendInventoryThink()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		if (!g_resendAt[i] || gpGlobals->time < g_resendAt[i])
+			continue;
+		g_resendAt[i] = 0;
+		edict_t* p = PlayerAt(i);
+		if (!p || !IsAlive(p))
+			continue;
+		void* pl = p->pvPrivateData;
+		if (g_ExitThirdPerson)
+			g_ExitThirdPerson(pl);
+		if (!g_SendInvSlot)
+			continue;
+		int n = 0;
+		for (int k = 1; k < 7; k++)
+		{
+			int str = Field<int>(pl, OFS_INV_SLOT + k * 4);
+			g_SendInvSlot(pl, k, str, 0);
+			n += str && *STRING(str);
+		}
+		Log("jogador %d: inventario reenviado ao cliente (%d slot(s) ocupado(s))", i, n);
+	}
+}
 static const float REVIVING = 3.0f; // pev->fuser3 durante a animacao de revive
 
 static float g_deadSince[33];
@@ -716,6 +757,9 @@ static void RespawnNear(int i, edict_t* p, edict_t* buddy)
 	p->v.iuser1 = 0;
 	p->v.fuser3 = 0;
 	g_orig.pfnSpawn(p); // CBasePlayer::Spawn
+	if (g_ExitThirdPerson)
+		g_ExitThirdPerson(p->pvPrivateData); // o Spawn nao sai da 3a pessoa da morte
+	g_resendAt[i] = gpGlobals->time + 1.0f;
 	PlaceNear(p, buddy);
 	g_wasAlive[i] = true; // UnstickThink nao precisa mexer
 	g_aliveLast[i] = true;
@@ -751,6 +795,7 @@ static void RespawnThink()
 				if (buddy)
 					PlaceNear(p, buddy);
 				GiveBackItems(i);
+				g_resendAt[i] = gpGlobals->time + 1.0f;
 				Log("jogador %d %s", i, away ? "renasceu pelo jogo - levando para perto do grupo" : "foi revivido");
 			}
 			g_aliveLast[i] = true;
@@ -784,6 +829,7 @@ static void ResetRespawn()
 	memset(g_deadSince, 0, sizeof(g_deadSince));
 	memset(g_diedHere, 0, sizeof(g_diedHere));
 	memset(g_aliveLast, 0, sizeof(g_aliveLast));
+	memset(g_resendAt, 0, sizeof(g_resendAt));
 	g_nextSnap = 0;
 }
 
@@ -1011,6 +1057,16 @@ static void InstallDetour()
 		g_StartRevive = (StartRevive_t)rev;
 	else
 		Log("aviso: assinatura de StartRevive nao confere - cofmp_revive desativado");
+	BYTE* tp = (BYTE*)g_hl + RVA_ExitThirdPerson;
+	if (!memcmp(tp, SIG_ExitThirdPerson, sizeof(SIG_ExitThirdPerson)))
+		g_ExitThirdPerson = (ExitThirdPerson_t)tp;
+	else
+		Log("aviso: assinatura de ExitThirdPerson nao confere - camera pode ficar em 3a pessoa ao renascer");
+	BYTE* slot = (BYTE*)g_hl + RVA_SendInvSlot;
+	if (!memcmp(slot, SIG_SendInvSlot, sizeof(SIG_SendInvSlot)))
+		g_SendInvSlot = (SendInvSlot_t)slot;
+	else
+		Log("aviso: assinatura de SendInvSlot nao confere - inventario pode sumir da tela ao renascer");
 
 	BYTE* fn = (BYTE*)g_hl + RVA_ChangeLevelNow;
 	if (memcmp(fn, SIG_ChangeLevelNow, sizeof(SIG_ChangeLevelNow)))
@@ -2064,6 +2120,7 @@ static void Hook_StartFrame()
 	RestoreThink();
 	ShareThink();
 	RespawnThink();
+	ResendInventoryThink();
 	SnapshotThink();
 }
 
@@ -2074,18 +2131,38 @@ static void Hook_StartFrame()
 // para models/player/simon/simon.mdl (gerado pelo instalador com a malha do Simon e as animacoes
 // do policial). Quem nao tem o arquivo ve o modelo padrao, como antes.
 
-static void ForceModel(edict_t* e, char* info)
+static const char* WantedModel(edict_t* e, char* info)
 {
 	const char* want = cv_model.string;
 	// bot nao tem canal de rede: a atualizacao do userinfo dele derruba o servidor na troca de mapa
 	if (!cv_enable.value || !want || !*want || !info || gpGlobals->maxClients <= 1 || (e->v.flags & FL_FAKECLIENT))
-		return;
-	if (_stricmp(g_eng->pfnInfoKeyValue(info, (char*)"model"), want))
-		g_eng->pfnSetClientKeyValue(g_eng->pfnIndexOfEdict(e), info, (char*)"model", (char*)want);
+		return nullptr;
+	return want;
 }
 
+static void ForceModel(edict_t* e, char* info)
+{
+	const char* want = WantedModel(e, info);
+	if (want && _stricmp(g_eng->pfnInfoKeyValue(info, (char*)"model"), want))
+	{
+		static int count[33];
+		int i = g_eng->pfnIndexOfEdict(e);
+		if (i > 0 && i < 33 && (++count[i] <= 3 || count[i] % 100 == 0))
+			Log("modelo do jogador %d: '%s' -> '%s' (%d vez(es))", i, g_eng->pfnInfoKeyValue(info, (char*)"model"), want, count[i]);
+		g_eng->pfnSetClientKeyValue(i, info, (char*)"model", (char*)want);
+	}
+}
+
+// O ClientUserInfoChanged do jogo so faz uma coisa: troca o modelo de volta para policeN e manda
+// MPModel. O engine chama ClientUserInfoChanged de novo a cada userinfo alterado, entao jogo e mod
+// ficavam trocando o modelo todo frame: dezenas de svc_updateuserinfo confiaveis por segundo para
+// cada cliente, e o canal confiavel do convidado atrasava minutos (inventario, lanterna...).
+// Com o modelo ja trocado, o jogo nao e chamado.
 static void Hook_ClientUserInfoChanged(edict_t* e, char* info)
 {
+	const char* want = WantedModel(e, info);
+	if (want && !_stricmp(g_eng->pfnInfoKeyValue(info, (char*)"model"), want))
+		return;
 	g_orig.pfnClientUserInfoChanged(e, info);
 	ForceModel(e, info);
 }

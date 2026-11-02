@@ -70,6 +70,11 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 - **Entrar:** cole o código (se ele já estiver copiado, aparece sozinho) e clique em "Entrar". Quando o túnel do host responde, a DLL roda `rate 100000; cl_cmdrate 60; cl_updaterate 30; connect 127.0.0.1:27020`.
 - **Trocar mapa (v1.10):** com o servidor já aberto, roda `cofmp_map <mapa>`: troca de mapa sem fechar o servidor, levando o inventário de cada jogador.
 - **Começar agora:** roda `cofmp_go`, que solta a espera do grupo ou da cutscene (abaixo) sem aguardar os outros.
+- **Entrar pela Steam (v1.11):** quando o código aparece, o host publica no rich presence `connect = -cofmpjoin <código>` e `status`. Isso usa o `steam_api.dll` que o jogo já iniciou (ISteamFriends013: SetRichPresence 36, ClearRichPresence 37, GetFriendRichPresence 38). Na lista de amigos aparece "Entrar no jogo". Esse texto sai quando o túnel do host fecha ou quando ele entra no jogo de outro.
+  - **Jogo aberto:** a DLL registra o `GameRichPresenceJoinRequested_t` (337) e chama `SteamAPI_RunCallbacks` na thread do HUD. O jogo não chama esse RunCallbacks.
+  - **Jogo fechado:** a Steam abre o jogo com o texto na linha de comando, e o `CoFLaunchApp.exe` repassa os argumentos ao `cof.exe`. A DLL lê `-cofmpjoin` 3 s depois que a janela aparece.
+  - Nos dois casos, preenche o código, abre o Home e entra.
+  - Se nada disso chegar, o Home vazio preenche sozinho o código de um amigo que está hospedando.
 
 **Sem VAC (v1.8):** no `hw.dll`, o servidor é seguro quando não há `-insecure` na linha de comando e `sv_lan` é 0. Por isso o servidor do Home abre com `sv_lan 1`. O amigo chega pelo túnel como 127.0.0.1, que conta como LAN, e entra normalmente. Por IP direto da internet não entra com `sv_lan 1`: para isso use o instalador (opção 3), que abre o jogo com `-insecure`. Com `sv_lan 1`, a banda de cada cliente é limitada por `sv_lan_rate`, que vale 20000 por padrão; o Home sobe para 100000.
 
@@ -83,6 +88,7 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 - a cada 10 s, ping e perda de cada jogador e os fps do servidor;
 - frames do servidor com mais de 250 ms;
 - do túnel, a cada 10 s: pacotes, bytes e pedaços enviados e recebidos e o estado P2P (relay ou direto, e a fila da Steam).
+- itens (v1.11): no `inventorydrop N`, a arma do slot antes e depois do `hl.dll` (modelo, arquivo de inventário em +0x110, `iuser3`, `effects`, dono, posição), seguida por 10 s; quando um jogador encosta numa arma/item e algo muda, o item e os 7 slots antes e depois.
 
 **Espera do grupo (v1.5):** ao carregar um mapa, o servidor congela os jogadores e segura os `trigger_*` (toque e `trigger_auto`) até nascerem `maxplayers` humanos. Depois de uma troca de mapa, espera quantos estavam no mapa anterior, por no máximo `cofmp_start_timeout` segundos (90 por padrão). Sem isso, o host nascia sozinho e a cutscene de abertura do `c_intro` rodava antes do amigo entrar. Desliga com `cofmp_start_wait 0`. Quem chega com uma `trigger_camera` ativa passa a ver a câmera também.
 

@@ -1714,11 +1714,15 @@ static void CutWaitThink()
 	}
 }
 
+static bool PickupTouch(edict_t* item, edict_t* player);
+
 static void Hook_Touch(edict_t* touched, edict_t* other)
 {
 	if (g_hold.active && ((IsTriggerEnt(touched) && IsPlayer(other)) || (IsTriggerEnt(other) && IsPlayer(touched))))
 		return;
 	if (!IsNull(touched) && !IsNull(other) && CutWaitTouch(touched, other))
+		return;
+	if (PickupTouch(touched, other))
 		return;
 	g_orig.pfnTouch(touched, other);
 	if (g_tracing)
@@ -1968,6 +1972,7 @@ static void RequestSkip(int i);
 static void TraceThink();
 static void InvWatchThink();
 static void TraceDrop(edict_t* e);
+static void DropCommand(edict_t* e);
 
 // ---------------------------------------------------------------- log de rede e desempenho
 //
@@ -2129,10 +2134,7 @@ static void Hook_ClientCommand(edict_t* e)
 		g_orig.pfnClientCommand(e);
 		return;
 	}
-	TraceDrop(e); // o que o hl.dll criar agora e o item jogado no chao
-	g_orig.pfnClientCommand(e);
-	TraceDrop(NULL);
-	TraceCheck("o proprio inventorydrop");
+	DropCommand(e);
 }
 
 static void Hook_ClientDisconnect(edict_t* e)
@@ -2479,6 +2481,100 @@ static void ResetTrace()
 	g_traced.clear();
 	g_tracing = false;
 	g_dropper = NULL;
+}
+
+static std::string SlotsOf(void* pl)
+{
+	std::string s;
+	for (int k = 0; k < 7; k++)
+	{
+		int str = Field<int>(pl, OFS_INV_SLOT + k * 4);
+		s += k ? " " : "";
+		s += str && *STRING(str) ? ItemName(STRING(str)) : "-";
+	}
+	return s;
+}
+
+// estado de uma arma/item no log: onde esta, se aparece e o que o hl.dll olha no drop e no pegar
+static std::string Describe(edict_t* e)
+{
+	if (!e)
+		return "(nenhum)";
+	char buf[400];
+	entvars_t* v = &e->v;
+	// +0x110 (arquivo do inventario) so existe nas armas; nos outros itens o campo e outra coisa
+	int file = e->pvPrivateData && !strncmp(STRING(v->classname), "weapon_", 7) ? Field<int>(e->pvPrivateData, 0x110) : 0;
+	_snprintf(buf, sizeof(buf) - 1,
+		"#%d '%s' livre %d modelo '%s' (%d) arquivo '%s' effects %d solid %d movetype %d iuser3 %d target '%s' "
+		"spawnflags 0x%x flags 0x%x dono #%d aiment #%d em %.0f %.0f %.0f",
+		g_eng->pfnIndexOfEdict(e), STRING(v->classname), e->free, v->model ? STRING(v->model) : "", v->modelindex,
+		file ? STRING(file) : "",
+		v->effects, v->solid, v->movetype, v->iuser3, v->target ? STRING(v->target) : "", v->spawnflags, v->flags,
+		v->owner ? g_eng->pfnIndexOfEdict(v->owner) : 0, v->aiment ? g_eng->pfnIndexOfEdict(v->aiment) : 0,
+		v->origin.x, v->origin.y, v->origin.z);
+	buf[sizeof(buf) - 1] = 0;
+	return buf;
+}
+
+// inventorydrop N: a arma do slot N antes e depois, e o destino dela nos 10 s seguintes
+static void DropCommand(edict_t* e)
+{
+	int i = g_eng->pfnIndexOfEdict(e), slot = atoi(g_eng->pfnCmd_Argv(1));
+	void* pl = e->pvPrivateData;
+	edict_t* w = NULL;
+	if (pl && slot >= 0 && slot < 7)
+	{
+		int cls = Field<int>(pl, OFS_INV_CLASS + slot * 4);
+		void* it = cls && *STRING(cls) ? FindItem(pl, STRING(cls)) : NULL;
+		if (it && PevOf(it))
+			w = PevOf(it)->pContainingEntity;
+		Log("jogador %d larga o slot %d ('%s'): arma %s", i, slot,
+			Field<int>(pl, OFS_INV_SLOT + slot * 4) ? STRING(Field<int>(pl, OFS_INV_SLOT + slot * 4)) : "",
+			Describe(w).c_str());
+	}
+	int serial = w ? w->serialnumber : 0;
+	TraceDrop(e); // o que o hl.dll criar agora e o item jogado no chao
+	g_orig.pfnClientCommand(e);
+	TraceDrop(NULL);
+	TraceCheck("o proprio inventorydrop");
+	if (!w)
+		return;
+	if (w->free || w->serialnumber != serial)
+	{
+		Log("  depois do drop: a arma foi liberada");
+		return;
+	}
+	Log("  depois do drop: %s", Describe(w).c_str());
+	if (g_traced.size() < 16)
+	{
+		g_traced.push_back({ w, serial, g_eng->pfnIndexOfEdict(w), gpGlobals->time + 10.0f, STRING(w->v.classname) });
+		g_tracing = true;
+	}
+}
+
+// jogador encostando numa arma/item: se algo mudou (pegou, nao coube, sumiu), uma linha com o antes e o depois
+static bool PickupTouch(edict_t* item, edict_t* player)
+{
+	if (IsNull(item) || IsNull(player) || !IsPlayer(player) || !player->pvPrivateData || !item->pvPrivateData)
+		return false;
+	const char* cls = STRING(item->v.classname);
+	if (strncmp(cls, "weapon_", 7) && strncmp(cls, "item_", 5) && strncmp(cls, "ammo_", 5))
+		return false;
+	void* pl = player->pvPrivateData;
+	std::string before = Describe(item), slots = SlotsOf(pl);
+	int serial = item->serialnumber, effects = item->v.effects, solid = item->v.solid;
+	edict_t* owner = item->v.owner;
+	g_orig.pfnTouch(item, player);
+	bool gone = item->free || item->serialnumber != serial;
+	std::string slotsAfter = SlotsOf(pl);
+	if (!gone && effects == item->v.effects && solid == item->v.solid && owner == item->v.owner && slots == slotsAfter)
+		return true;
+	Log("jogador %d pegou %s", g_eng->pfnIndexOfEdict(player), before.c_str());
+	Log("  slots [%s] -> [%s]; item depois: %s", slots.c_str(), slotsAfter.c_str(),
+		gone ? "liberado" : Describe(item).c_str());
+	if (g_tracing)
+		TraceCheck("o pegar item");
+	return true;
 }
 
 // Inventario de cada jogador (os 7 slots e as armas): uma linha no log a cada mudanca.

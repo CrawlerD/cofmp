@@ -143,6 +143,130 @@ static bool ValidCode(const std::string& s)
 		(_strtoui64(s.c_str(), NULL, 10) >> 52) == 0x011;
 }
 
+// ---------------------------------------------------------------- Steam: "Entrar no jogo" da lista de amigos
+//
+// O host publica no rich presence "connect" = "-cofmpjoin <codigo>"; a Steam mostra "Entrar no jogo" para os amigos.
+// Com o jogo aberto, o clique chega como GameRichPresenceJoinRequested_t; com ele fechado, a Steam abre o jogo com o
+// texto na linha de comando (o CoFLaunchApp.exe repassa os argumentos para o cof.exe).
+// Usa o steam_api.dll que o proprio jogo ja carregou e iniciou (ISteamFriends013, indices conferidos com a Steam).
+
+struct CSteamID { unsigned long long v; };
+
+class CCallbackBase // mesmo layout do SDK, igual ao do tunel
+{
+public:
+	virtual void Run(void* param) = 0;
+	virtual void Run(void* param, bool ioFailure, unsigned long long call) = 0;
+	virtual int GetCallbackSizeBytes() = 0;
+	unsigned char m_nCallbackFlags = 0;
+	int m_iCallback = 0;
+};
+
+enum { CB_JOIN_REQUESTED = 337, FRIEND_IMMEDIATE = 4 };
+enum { VT_FRIEND_COUNT = 3, VT_FRIEND_BY_INDEX = 4, VT_SET_RP = 36, VT_CLEAR_RP = 37, VT_GET_FRIEND_RP = 38 };
+static const char JOIN_ARG[] = "-cofmpjoin";
+
+static void (__cdecl* g_runCallbacks)();
+static bool g_presence; // o rich presence "connect" esta publicado
+
+static void** SteamFriends()
+{
+	HMODULE api = GetModuleHandleA("steam_api.dll");
+	typedef void** (__cdecl * Get_t)();
+	Get_t get = api ? (Get_t)GetProcAddress(api, "SteamFriends") : NULL;
+	return get ? get() : NULL;
+}
+
+static void SetPresence(const std::string& code)
+{
+	void** f = SteamFriends();
+	if (!f)
+		return;
+	void** vt = *(void***)f;
+	typedef bool(__thiscall * Set_t)(void*, const char*, const char*);
+	typedef void(__thiscall * Clear_t)(void*);
+	if (code.empty())
+	{
+		((Clear_t)vt[VT_CLEAR_RP])(f);
+		g_presence = false;
+		return;
+	}
+	std::string connect = std::string(JOIN_ARG) + " " + code;
+	g_presence = ((Set_t)vt[VT_SET_RP])(f, "connect", connect.c_str());
+	((Set_t)vt[VT_SET_RP])(f, "status", "Hospedando o co-op");
+	LogFile_Write("hud", g_presence ? "rich presence publicado (Entrar no jogo pela Steam)" : "rich presence recusado");
+}
+
+// codigo depois de "-cofmpjoin" (linha de comando ou o connect do rich presence)
+static std::string JoinArg(const char* s)
+{
+	const char* p = s ? strstr(s, JOIN_ARG) : NULL;
+	if (!p)
+		return "";
+	p += sizeof(JOIN_ARG) - 1;
+	p += strspn(p, " \t\"");
+	return std::string(p, strspn(p, "0123456789"));
+}
+
+// amigo no Cry of Fear com o servidor do co-op aberto: o codigo dele
+static std::string HostingFriend()
+{
+	void** f = SteamFriends();
+	if (!f)
+		return "";
+	void** vt = *(void***)f;
+	typedef int(__thiscall * Count_t)(void*, int);
+	typedef CSteamID(__thiscall * ByIndex_t)(void*, int, int);
+	typedef const char*(__thiscall * GetRP_t)(void*, CSteamID, const char*);
+	int n = ((Count_t)vt[VT_FRIEND_COUNT])(f, FRIEND_IMMEDIATE);
+	for (int k = 0; k < n; k++)
+	{
+		CSteamID id = ((ByIndex_t)vt[VT_FRIEND_BY_INDEX])(f, k, FRIEND_IMMEDIATE);
+		std::string code = JoinArg(((GetRP_t)vt[VT_GET_FRIEND_RP])(f, id, "connect"));
+		if (!code.empty())
+			return code;
+	}
+	return "";
+}
+
+static void JoinFromSteam(const std::string& code, const char* from);
+
+class JoinRequested : public CCallbackBase
+{
+public:
+	void Run(void* p) override
+	{
+		// GameRichPresenceJoinRequested_t: CSteamID do amigo + char connect[256]
+		const char* connect = (const char*)p + 8;
+		JoinFromSteam(JoinArg(std::string(connect, strnlen(connect, 256)).c_str()), "lista de amigos");
+	}
+	void Run(void* p, bool, unsigned long long) override { Run(p); }
+	int GetCallbackSizeBytes() override { return 8 + 256; }
+};
+
+static void SteamThink()
+{
+	static bool tried;
+	if (!tried)
+	{
+		HMODULE api = GetModuleHandleA("steam_api.dll");
+		if (!api || !SteamFriends())
+			return; // o jogo ainda nao iniciou a Steam
+		tried = true;
+		typedef void(__cdecl * Register_t)(CCallbackBase*, int);
+		Register_t reg = (Register_t)GetProcAddress(api, "SteamAPI_RegisterCallback");
+		g_runCallbacks = (void(__cdecl*)())GetProcAddress(api, "SteamAPI_RunCallbacks");
+		static JoinRequested onJoin;
+		if (reg && g_runCallbacks)
+			reg(&onJoin, CB_JOIN_REQUESTED);
+		else
+			g_runCallbacks = NULL;
+	}
+	// o jogo nao chama o RunCallbacks deste steam_api.dll; os callbacks rodam aqui, na thread do HUD
+	if (g_runCallbacks)
+		g_runCallbacks();
+}
+
 // ---------------------------------------------------------------- janela
 
 static void Status(const wchar_t* s)
@@ -210,6 +334,9 @@ static void ShowHud(bool show)
 	std::string clip = ClipboardText();
 	if (ItemText(ID_JOIN_CODE).empty() && ValidCode(clip) && clip != ItemText(ID_CODE))
 		SetDlgItemTextA(g_hud, ID_JOIN_CODE, clip.c_str());
+	// senao, o de um amigo que esta hospedando agora
+	if (ItemText(ID_JOIN_CODE).empty())
+		SetDlgItemTextA(g_hud, ID_JOIN_CODE, HostingFriend().c_str());
 }
 
 // nome do mapa escolhido, sem ".bsp"; vazio (e aviso no status) se for invalido
@@ -281,6 +408,7 @@ static void CheckCode()
 		KillTimer(g_hud, TIMER_CODE);
 		SetDlgItemTextA(g_hud, ID_CODE, code.c_str());
 		CopyText(code);
+		SetPresence(code);
 		Status(L"Servidor criado! Código copiado: mande para o seu amigo. O mapa começa quando todos entrarem.");
 	}
 	else if (!TunnelAlive())
@@ -308,9 +436,25 @@ static void DoJoin()
 		Status(L"Não achei o túnel. Rode o instalador de novo (opção 1).");
 		return;
 	}
+	if (g_presence) // deixou de hospedar
+		SetPresence("");
 	Status(L"Conectando ao host pela Steam...");
 	g_codeStart = GetTickCount();
 	SetTimer(g_hud, TIMER_CONNECT, 250, NULL);
+}
+
+// "Entrar no jogo" na Steam: preenche o codigo e entra sozinho
+static void JoinFromSteam(const std::string& code, const char* from)
+{
+	char msg[160];
+	_snprintf(msg, sizeof(msg) - 1, "entrar pela Steam (%s): codigo '%s'", from, code.c_str());
+	msg[sizeof(msg) - 1] = 0;
+	LogFile_Write("hud", msg);
+	if (!ValidCode(code))
+		return;
+	SetDlgItemTextA(g_hud, ID_JOIN_CODE, code.c_str());
+	ShowHud(true);
+	DoJoin();
 }
 
 // o tunel grava conectado.txt quando o tunel do host responde; so entao vale mandar o connect
@@ -389,9 +533,26 @@ static void CoopPanelThink()
 
 static void Poll()
 {
-	static bool homeDown, enterDown;
+	static bool homeDown, enterDown, cmdLineDone;
+	static DWORD attachedAt;
 	CoopPanelThink();
 	AttachGame();
+	SteamThink();
+	if (g_presence && !TunnelAlive()) // o tunel do host fechou: tira o "Entrar no jogo"
+		SetPresence("");
+	// jogo aberto pela Steam com "-cofmpjoin <codigo>": entra assim que o menu aparece
+	if (!cmdLineDone && g_game)
+	{
+		if (!attachedAt)
+			attachedAt = GetTickCount();
+		else if (GetTickCount() - attachedAt > 3000)
+		{
+			cmdLineDone = true;
+			std::string code = JoinArg(GetCommandLineA());
+			if (!code.empty())
+				JoinFromSteam(code, "linha de comando");
+		}
+	}
 	HWND fg = GetForegroundWindow();
 	DWORD pid = 0;
 	GetWindowThreadProcessId(fg, &pid);
@@ -551,6 +712,7 @@ static DWORD WINAPI HudThread(void*)
 	*strrchr(path, '\\') = 0;
 	g_cry = path;
 	g_tunnelDir = g_cry + "\\" COFMP_TUNNEL_DIR;
+	LogFile_Open((g_cry + "\\" COFMP_DIR).c_str()); // o g_logPath do logfile.h e de cada .cpp
 
 	g_job = CreateJobObjectA(NULL, NULL);
 	JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};

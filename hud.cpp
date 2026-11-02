@@ -30,7 +30,7 @@ static std::string g_cry, g_tunnelDir;
 static DWORD g_codeStart;
 static HFONT g_font, g_bold;
 
-enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS };
+enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS, ID_GO };
 enum { WM_HUD_CMD = WM_APP + 0x43 };
 enum { TIMER_POLL = 1, TIMER_CODE, TIMER_CONNECT };
 static const int TUNNEL_PORT = 27020;
@@ -254,7 +254,7 @@ static void CheckCode()
 		KillTimer(g_hud, TIMER_CODE);
 		SetDlgItemTextA(g_hud, ID_CODE, code.c_str());
 		CopyText(code);
-		Status(L"Servidor criado! O código já foi copiado: mande para o seu amigo pelo chat da Steam.");
+		Status(L"Servidor criado! Código copiado: mande para o seu amigo. O mapa começa quando todos entrarem.");
 	}
 	else if (!TunnelAlive())
 	{
@@ -300,9 +300,53 @@ static void Connect()
 	ShowHud(false);
 }
 
+// ---------------------------------------------------------------- painel nativo do co-op
+
+// O client.dll do CoF so desenha a lista do co-op ("Nome - Health - Ping", com o icone de quem tem
+// seringa) quando o nome do mapa tem "cof_" (os mapas c_cof_*). Trocamos o texto que ele procura
+// pelo nosso: vazio (vale qualquer mapa) quando o jogo tem mais de um jogador, "cof_" no single player.
+static char g_coopTag[8] = "cof_";
+static const DWORD RVA_PANEL_PUSH = 0x3c66c;  // push "cof_" antes do strstr(GetLevelName(), ...)
+static const DWORD RVA_COF_STR = 0x14688c;
+static const DWORD RVA_GETMAXCLIENTS = 0x1b2698; // gEngfuncs.GetMaxClients (copia do client.dll)
+
+static void CoopPanelThink()
+{
+	static bool tried, patched;
+	static BYTE* base;
+	if (!tried)
+	{
+		base = (BYTE*)GetModuleHandleA("client.dll");
+		if (!base)
+			return;
+		tried = true;
+		BYTE* push = base + RVA_PANEL_PUSH;
+		if (push[0] != 0x68 || *(DWORD*)(push + 1) != (DWORD)(base + RVA_COF_STR) ||
+			memcmp(base + RVA_COF_STR, "cof_", 5))
+			return; // outra versao do client.dll
+		DWORD old;
+		if (!VirtualProtect(push + 1, 4, PAGE_EXECUTE_READWRITE, &old))
+			return;
+		*(DWORD*)(push + 1) = (DWORD)g_coopTag;
+		VirtualProtect(push + 1, 4, old, &old);
+		FlushInstructionCache(GetCurrentProcess(), push, 5);
+		patched = true;
+	}
+	if (!patched)
+		return;
+	typedef int (*GetMaxClients_t)();
+	GetMaxClients_t maxClients = *(GetMaxClients_t*)(base + RVA_GETMAXCLIENTS);
+	bool mp = maxClients && maxClients() > 1;
+	if (mp && g_coopTag[0])
+		g_coopTag[0] = 0;
+	else if (!mp && !g_coopTag[0])
+		g_coopTag[0] = 'c'; // "of_" continua no buffer
+}
+
 static void Poll()
 {
 	static bool homeDown;
+	CoopPanelThink();
 	AttachGame();
 	bool down = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
 	if (down && !homeDown)
@@ -335,6 +379,11 @@ static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			break;
 		case ID_JOIN:
 			DoJoin();
+			break;
+		case ID_GO: // o mapa espera o grupo antes de rodar as cutscenes; aqui o host comeca sem esperar
+			Queue("cofmp_go\n");
+			Status(L"Começando sem esperar os outros jogadores.");
+			ShowHud(false);
 			break;
 		case ID_COPY:
 			if (!ItemText(ID_CODE).empty())
@@ -405,7 +454,7 @@ static void CreateHud()
 	HWND players = Ctl(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST, 95, 62, 55, 120, ID_PLAYERS);
 	for (const wchar_t* n : { L"2", L"3", L"4" })
 		SendMessageW(players, CB_ADDSTRING, 0, (LPARAM)n);
-	SendMessageW(players, CB_SETCURSEL, 2, 0);
+	SendMessageW(players, CB_SETCURSEL, 0, 0); // o mapa espera esse numero de jogadores para comecar
 	Ctl(L"STATIC", L"Mapa:", SC, 162, 62, 40, 23, 0);
 	HWND map = Ctl(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL | CBS_SORT, 205, 62,
 		150, 300, ID_MAP);
@@ -420,8 +469,9 @@ static void CreateHud()
 		} while (FindNextFileA(fh, &fd));
 		FindClose(fh);
 	}
-	SetWindowTextA(map, "c_apartment1"); // comeco da campanha
-	Ctl(L"BUTTON", L"Criar servidor", B, 22, 94, 333, 28, ID_HOST);
+	SetWindowTextA(map, "c_intro"); // comeco do jogo, com a cutscene
+	Ctl(L"BUTTON", L"Criar servidor", B, 22, 94, 200, 28, ID_HOST);
+	Ctl(L"BUTTON", L"Começar agora", B, 228, 94, 127, 28, ID_GO);
 	Ctl(L"STATIC", L"Código:", SC, 22, 132, 50, 23, 0);
 	Ctl(L"EDIT", L"", E | ES_READONLY, 75, 132, 200, 23, ID_CODE);
 	Ctl(L"BUTTON", L"Copiar", B, 282, 132, 73, 23, ID_COPY);

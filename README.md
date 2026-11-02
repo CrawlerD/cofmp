@@ -58,8 +58,13 @@ Os outros jogadores abrem o Cry of Fear e digitam no console (tecla `'`) `connec
 
 ### Janela do co-op no jogo (tecla Home)
 Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partida).
-- **Hospedar:** escolha o número de jogadores e o mapa e clique em "Criar servidor". A DLL roda `disconnect; sv_lan 0; maxplayers N; map X`, abre o túnel em modo host e mostra o código, que já vai para a área de transferência.
+- **Hospedar:** escolha o número de jogadores e o mapa (padrão: 2 e `c_intro`) e clique em "Criar servidor". A DLL roda `disconnect; sv_lan 0; maxplayers N; map X`, abre o túnel em modo host e mostra o código, que já vai para a área de transferência.
 - **Entrar:** cole o código (se ele já estiver copiado, aparece sozinho) e clique em "Entrar". O túnel conecta e, 3 s depois, a DLL roda `connect 127.0.0.1:27020`.
+- **Começar agora:** roda `cofmp_go`, que solta a espera do grupo (abaixo) sem aguardar os outros.
+
+**Espera do grupo (v1.5):** ao carregar um mapa, o servidor congela os jogadores e segura os `trigger_*` (toque e `trigger_auto`) até nascerem `maxplayers` humanos. Depois de uma troca de mapa, espera quantos estavam no mapa anterior, por no máximo `cofmp_start_timeout` segundos (90 por padrão). Sem isso, o host nascia sozinho e a cutscene de abertura do `c_intro` rodava antes do amigo entrar. Desliga com `cofmp_start_wait 0`. Quem chega com uma `trigger_camera` ativa passa a ver a câmera também.
+
+**Painel nativo do co-op (v1.5):** o `client.dll` só desenha o painel "Nome - Health N - Ping N" com o ícone da seringa nos mapas `cof_*`. Em multiplayer, a DLL troca a string comparada por uma vazia, então o painel aparece também nos mapas da campanha (`c_*`).
 
 Como funciona por dentro:
 - A janela é Win32 e roda numa thread do `cofmp.dll`, que o engine carrega no processo do jogo já no menu (`hud.cpp`).
@@ -69,7 +74,7 @@ Como funciona por dentro:
 - Em tela cheia, o jogo pode minimizar enquanto a janela está aberta.
 
 ### Sem abrir porta: túnel pela Steam
-O `CoF_Tunel.exe` (com o `steam_api.dll` ao lado) leva o tráfego do jogo pela rede P2P da Steam. Ele se identifica como Spacewar (appid 480), então a Steam mostra "jogando Spacewar" enquanto ele está aberto. Não precisa de VPN nem de porta aberta.
+O `CoF_Tunel.exe` (com o `steam_api.dll` ao lado) leva o tráfego do jogo pela rede P2P da Steam. Ele se identifica como o próprio Cry of Fear (appid 223710). A Steam passou a recusar o appid 480 (Spacewar), e todo mundo que joga o mod já tem o Cry of Fear. Não precisa de VPN nem de porta aberta.
 1. **Host:** no instalador, opção **3**. O jogo abre hospedando e o túnel abre junto, mostrando um código (já copiado) para mandar ao amigo.
 2. **Amigo:** no instalador, opção **4**. Ele cola o código, o túnel conecta e o jogo abre com `connect 127.0.0.1:27020`. Se não entrar, é só repetir esse comando no console.
 

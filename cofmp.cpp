@@ -40,6 +40,8 @@ static cvar_t cv_keep_inv = { (char*)"cofmp_keep_inventory", (char*)"1", FCVAR_S
 static cvar_t cv_share_items = { (char*)"cofmp_share_items", (char*)"1", FCVAR_SERVER };
 static cvar_t cv_respawn_time = { (char*)"cofmp_respawn_time", (char*)"30", FCVAR_SERVER };
 static cvar_t cv_model = { (char*)"cofmp_model", (char*)"simon", FCVAR_SERVER };
+static cvar_t cv_start_wait = { (char*)"cofmp_start_wait", (char*)"1", FCVAR_SERVER };
+static cvar_t cv_start_timeout = { (char*)"cofmp_start_timeout", (char*)"90", FCVAR_SERVER };
 
 // ---------------------------------------------------------------- util
 
@@ -1214,6 +1216,132 @@ static void Cmd_Tp()
 	}
 }
 
+// ---------------------------------------------------------------- comeco junto
+//
+// Muitos mapas comecam com uma cutscene disparada por trigger_auto ou por um trigger_once em volta do
+// info_player_start (o c_intro, por exemplo). Em MP o host nasce primeiro e a cena roda antes de o amigo
+// entrar. Entao, no comeco de cada mapa, os gatilhos ficam parados e os jogadores congelados ate o grupo
+// todo nascer:
+//  - servidor aberto agora: espera maxplayers jogadores, ou o host mandar cofmp_go (Home > Comecar agora);
+//  - troca de mapa ou reinicio: espera quem estava no mapa anterior (no maximo cofmp_start_timeout s).
+
+static struct
+{
+	bool active;
+	int want;
+	float deadline; // 0 = sem limite
+	float releaseAt;
+	float nextMsg;
+	bool frozen[33]; // congelados por nos
+} g_hold;
+static int g_humansLast = -1; // humanos no mapa; no ServerActivate ainda e o valor do mapa anterior
+
+static int CountHumans(bool aliveOnly)
+{
+	int n = 0;
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (o && !(o->v.flags & FL_FAKECLIENT) && (!aliveOnly || IsAlive(o)))
+			n++;
+	}
+	return n;
+}
+
+static void StartHold(bool fresh)
+{
+	memset(&g_hold, 0, sizeof(g_hold));
+	if (!cv_enable.value || !cv_start_wait.value || gpGlobals->maxClients <= 1)
+		return;
+	g_hold.active = true;
+	if (fresh)
+		g_hold.want = gpGlobals->maxClients;
+	else
+	{
+		g_hold.want = g_humansLast > 1 ? g_humansLast : 1;
+		g_hold.deadline = gpGlobals->time + cv_start_timeout.value;
+	}
+	Log("segurando o comeco do mapa ate %d jogador(es) nascerem%s", g_hold.want,
+		fresh ? " (ou cofmp_go)" : "");
+}
+
+static void ReleaseHold(const char* why)
+{
+	if (!g_hold.active)
+		return;
+	g_hold.active = false;
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (o && g_hold.frozen[k])
+			o->v.flags &= ~FL_FROZEN;
+	}
+	CenterPrintAll(" ");
+	Log("comeco do mapa liberado (%s)", why);
+}
+
+static void HoldThink()
+{
+	if (!g_hold.active)
+	{
+		g_humansLast = CountHumans(false);
+		return;
+	}
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (o && IsAlive(o) && !(o->v.flags & FL_FROZEN))
+		{
+			o->v.flags |= FL_FROZEN;
+			g_hold.frozen[k] = true;
+		}
+	}
+	int have = CountHumans(true);
+	if (!g_hold.releaseAt && (have >= g_hold.want || (g_hold.deadline && gpGlobals->time > g_hold.deadline)))
+		g_hold.releaseAt = gpGlobals->time + 2.0f; // o ultimo a nascer ainda esta abrindo a tela
+	if (g_hold.releaseAt && gpGlobals->time >= g_hold.releaseAt)
+		ReleaseHold(have >= g_hold.want ? "todos nasceram" : "tempo esgotado");
+	else if (gpGlobals->time >= g_hold.nextMsg)
+	{
+		g_hold.nextMsg = gpGlobals->time + 1.0f;
+		char msg[160];
+		_snprintf(msg, sizeof(msg), "Esperando o grupo: %d/%d\nO host pode comecar antes: Home > Comecar agora",
+			have, g_hold.want);
+		msg[sizeof(msg) - 1] = 0;
+		CenterPrintAll(msg);
+	}
+}
+
+// cofmp_go: comeca o mapa sem esperar mais ninguem
+static void Cmd_Go()
+{
+	if (g_hold.active)
+		ReleaseHold("cofmp_go");
+}
+
+static bool IsTriggerEnt(edict_t* e)
+{
+	return !IsNull(e) && !strncmp(STRING(e->v.classname), "trigger_", 8);
+}
+
+static void Hook_Touch(edict_t* touched, edict_t* other)
+{
+	if (g_hold.active && ((IsTriggerEnt(touched) && IsPlayer(other)) || (IsTriggerEnt(other) && IsPlayer(touched))))
+		return;
+	g_orig.pfnTouch(touched, other);
+}
+
+static void Hook_Think(edict_t* ent)
+{
+	// o engine zera nextthink antes de chamar Think: reagenda para tentar de novo
+	if (g_hold.active && !IsNull(ent) && !strcmp(STRING(ent->v.classname), "trigger_auto"))
+	{
+		ent->v.nextthink = gpGlobals->time + 0.1f;
+		return;
+	}
+	g_orig.pfnThink(ent);
+}
+
 // ---------------------------------------------------------------- hooks DLL_FUNCTIONS
 
 static void Hook_GameInit()
@@ -1225,6 +1353,8 @@ static void Hook_GameInit()
 	g_eng->pfnCVarRegister(&cv_share_items);
 	g_eng->pfnCVarRegister(&cv_respawn_time);
 	g_eng->pfnCVarRegister(&cv_model);
+	g_eng->pfnCVarRegister(&cv_start_wait);
+	g_eng->pfnCVarRegister(&cv_start_timeout);
 	g_eng->pfnAddServerCommand((char*)"cofmp_exits", Cmd_Exits);
 	g_eng->pfnAddServerCommand((char*)"cofmp_tp_exit", Cmd_TpExit);
 	g_eng->pfnAddServerCommand((char*)"cofmp_debug", Cmd_Debug);
@@ -1237,6 +1367,7 @@ static void Hook_GameInit()
 	g_eng->pfnAddServerCommand((char*)"cofmp_kill", Cmd_Kill);
 	g_eng->pfnAddServerCommand((char*)"cofmp_revive", Cmd_Revive);
 	g_eng->pfnAddServerCommand((char*)"cofmp_after", Cmd_After);
+	g_eng->pfnAddServerCommand((char*)"cofmp_go", Cmd_Go);
 	g_orig.pfnGameInit();
 	Log("carregado (co-op da campanha)");
 }
@@ -1303,6 +1434,12 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 		}
 	}
 	g_transit.pending = false;
+
+	// servidor recem-aberto (ninguem veio do mapa anterior) espera a lotacao; troca de mapa espera o grupo
+	if (_strnicmp(map, "c_game_menu", 11))
+		StartHold(g_humansLast <= 0 && !arrived && !restart);
+	else
+		memset(&g_hold, 0, sizeof(g_hold));
 
 	// -cofmp_test <cfg>: roda um roteiro de teste no primeiro mapa de campanha (com cofmp_after)
 	static bool testDone;
@@ -1404,6 +1541,8 @@ static void UnstickThink()
 	}
 }
 
+static void CamJoinThink();
+
 static void Hook_StartFrame()
 {
 	Hud_RunPending();
@@ -1412,6 +1551,8 @@ static void Hook_StartFrame()
 	if (!cv_enable.value || gpGlobals->maxClients <= 1)
 		return;
 	BotThink();
+	HoldThink();
+	CamJoinThink();
 	GatherThink();
 	ArriveThink();
 	UnstickThink();
@@ -1466,6 +1607,9 @@ static void Hook_ClientDisconnect(edict_t* e)
 		g_aliveLast[i] = false;
 		if (g_camOwner == i)
 			Hook_SetView(e, e); // devolve a visao dos outros
+		g_hold.frozen[i] = false;
+		if (!g_hold.active && !(e->v.flags & FL_FAKECLIENT) && g_humansLast > 0)
+			g_humansLast--;
 		Log("jogador %d desconectou (foto do inventario %s)", i, g_inv[i].valid ? "mantida" : "vazia");
 	}
 	g_orig.pfnClientDisconnect(e);
@@ -1498,6 +1642,8 @@ static void BuildTable(DLL_FUNCTIONS* out)
 	out->pfnClientDisconnect = Hook_ClientDisconnect;
 	out->pfnClientUserInfoChanged = Hook_ClientUserInfoChanged;
 	out->pfnClientPutInServer = Hook_ClientPutInServer;
+	out->pfnTouch = Hook_Touch;
+	out->pfnThink = Hook_Think;
 	InstallDetour();
 }
 
@@ -1509,6 +1655,7 @@ static void BuildTable(DLL_FUNCTIONS* out)
 
 static enginefuncs_t g_engForHL;
 static bool g_camShared[33];    // jogadores que estamos mostrando a camera
+static edict_t* g_camView;      // camera ligada agora
 
 static void Hook_SetView(const edict_t* client, const edict_t* view)
 {
@@ -1521,6 +1668,7 @@ static void Hook_SetView(const edict_t* client, const edict_t* view)
 	if (on && (!g_camOwner || g_camOwner == i))
 	{
 		g_camOwner = i;
+		g_camView = (edict_t*)view;
 		int n = 0;
 		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
 		{
@@ -1549,13 +1697,36 @@ static void Hook_SetView(const edict_t* client, const edict_t* view)
 			o->v.flags &= ~FL_FROZEN;
 		}
 		g_camOwner = 0;
+		g_camView = NULL;
 		Log("cutscene: camera desligada para todos");
+	}
+}
+
+// Quem nasce no meio da cena (entrou atrasado, renasceu) passa a ver a mesma camera.
+static void CamJoinThink()
+{
+	if (!g_camOwner || IsNull(g_camView))
+		return;
+	edict_t* owner = PlayerAt(g_camOwner);
+	if (!owner)
+		return;
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (k == g_camOwner || g_camShared[k] || !o || !IsAlive(o) || (o->v.flags & FL_FAKECLIENT))
+			continue;
+		g_eng->pfnSetView(o, g_camView);
+		if (owner->v.flags & FL_FROZEN)
+			o->v.flags |= FL_FROZEN;
+		g_camShared[k] = true;
+		Log("cutscene: jogador %d chegou no meio da cena e ve a camera '%s'", k, STRING(g_camView->v.targetname));
 	}
 }
 
 static void ResetCutscene()
 {
 	g_camOwner = 0;
+	g_camView = NULL;
 	memset(g_camShared, 0, sizeof(g_camShared));
 }
 

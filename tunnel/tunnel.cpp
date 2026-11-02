@@ -1,4 +1,5 @@
-// Tunel UDP pela rede P2P da Steam (appid 480, Spacewar), para jogar sem abrir porta.
+// Tunel UDP pela rede P2P da Steam, para jogar sem abrir porta. Se identifica como o proprio Cry of Fear
+// (appid 223710): a Steam passou a recusar o SteamAPI_Init com o appid 480 (Spacewar).
 // host: recebe pacotes P2P dos amigos e entrega no servidor local (127.0.0.1:27015), um socket por amigo.
 // join: escuta 127.0.0.1:27020; o jogo faz "connect 127.0.0.1:27020" e os pacotes vao para o host pela Steam.
 // Usa o steam_api.dll antigo (interfaces SteamNetworking005 / SteamUser016 / SteamFriends013) carregado em runtime.
@@ -73,6 +74,7 @@ public:
 };
 
 enum { P2P_UNRELIABLE = 0, P2P_RELIABLE = 2, CB_SESSION_REQUEST = 1202, CB_CONNECT_FAIL = 1203 };
+static const char* APPID = "223710"; // Cry of Fear
 static const uint32_t MAX_UNRELIABLE = 1200; // acima disso a Steam so aceita envio confiavel
 
 static bool (__cdecl* pInit)();
@@ -200,11 +202,11 @@ int main(int argc, char** argv)
 	FILE* f = fopen("steam_appid.txt", "w");
 	if (f)
 	{
-		fputs("480", f);
+		fputs(APPID, f);
 		fclose(f);
 	}
-	SetEnvironmentVariableA("SteamAppId", "480");
-	SetEnvironmentVariableA("SteamGameId", "480");
+	SetEnvironmentVariableA("SteamAppId", APPID);
+	SetEnvironmentVariableA("SteamGameId", APPID);
 
 	std::string mode = argc > 1 ? argv[1] : "";
 	if (mode.empty())

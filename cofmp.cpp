@@ -11,6 +11,7 @@
 //  - Cada jogador chega no mapa novo na mesma posicao relativa ao info_landmark.
 
 #include "extdll.h"
+#include <intrin.h>
 #include <algorithm>
 #include <string>
 #include <unordered_map>
@@ -181,6 +182,9 @@ static struct
 } g_gather;
 
 static bool g_changing; // ja pedimos changelevel neste mapa
+static void StopSkip(const char* why);
+static bool g_tracing; // ha entidades de um inventorydrop sendo seguidas (rastreio de itens)
+static void TraceCheck(const char* during);
 
 static struct
 {
@@ -790,6 +794,7 @@ static void DoChangeLevel(int entIndex, edict_t* anchor = NULL)
 	if (it == g_changelevels.end() || g_changing)
 		return;
 	const ChangeInfo& ci = it->second;
+	StopSkip("troca de mapa");
 	g_changing = true;
 	g_gather.active = false;
 
@@ -822,6 +827,43 @@ static void DoChangeLevel(int entIndex, edict_t* anchor = NULL)
 
 	Log("changelevel -> %s (landmark '%s')", ci.map.c_str(), ci.landmark.c_str());
 	g_eng->pfnChangeLevel((char*)ci.map.c_str(), NULL);
+}
+
+// cofmp_map <mapa>: troca de mapa sem fechar o servidor nem o tunel (Home > Trocar mapa). Cada um leva o
+// inventario e nasce no spawn do mapa novo.
+static void Cmd_Map()
+{
+	const char* map = g_eng->pfnCmd_Argc() > 1 ? g_eng->pfnCmd_Argv(1) : "";
+	if (gpGlobals->maxClients <= 1 || !*map)
+	{
+		Log("uso: cofmp_map <mapa> (com o servidor co-op aberto)");
+		return;
+	}
+	if (!g_eng->pfnIsMapValid((char*)map))
+	{
+		Log("cofmp_map: o mapa '%s' nao existe", map);
+		return;
+	}
+	if (g_changing)
+		return;
+	std::string name = map; // o Argv nao sobrevive ao resto
+	StopSkip("troca de mapa");
+	g_changing = true;
+	g_gather.active = false;
+	g_transit.pending = true;
+	g_transit.map = name;
+	g_transit.landmark = "";
+	g_transit.hasAnchor = false;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		g_transit.has[i] = false;
+		g_inv[i].valid = false;
+		if (p && IsAlive(p) && cv_keep_inv.value && g_GiveNamedItem)
+			CaptureInventory(i, p);
+	}
+	Log("cofmp_map -> %s", name.c_str());
+	g_eng->pfnChangeLevel((char*)name.c_str(), NULL);
 }
 
 static void CenterPrintAll(const char* msg)
@@ -1679,6 +1721,14 @@ static void Hook_Touch(edict_t* touched, edict_t* other)
 	if (!IsNull(touched) && !IsNull(other) && CutWaitTouch(touched, other))
 		return;
 	g_orig.pfnTouch(touched, other);
+	if (g_tracing)
+	{
+		char during[160];
+		_snprintf(during, sizeof(during), "touch de '%s' #%d com '%s' #%d", STRING(touched->v.classname),
+			g_eng->pfnIndexOfEdict(touched), STRING(other->v.classname), g_eng->pfnIndexOfEdict(other));
+		during[sizeof(during) - 1] = 0;
+		TraceCheck(during);
+	}
 }
 
 static void Hook_Think(edict_t* ent)
@@ -1690,6 +1740,13 @@ static void Hook_Think(edict_t* ent)
 		return;
 	}
 	g_orig.pfnThink(ent);
+	if (g_tracing)
+	{
+		char during[128];
+		_snprintf(during, sizeof(during), "think de '%s' #%d", STRING(ent->v.classname), g_eng->pfnIndexOfEdict(ent));
+		during[sizeof(during) - 1] = 0;
+		TraceCheck(during);
+	}
 }
 
 // ---------------------------------------------------------------- hooks DLL_FUNCTIONS
@@ -1719,6 +1776,7 @@ static void Hook_GameInit()
 	g_eng->pfnAddServerCommand((char*)"cofmp_revive", Cmd_Revive);
 	g_eng->pfnAddServerCommand((char*)"cofmp_after", Cmd_After);
 	g_eng->pfnAddServerCommand((char*)"cofmp_go", Cmd_Go);
+	g_eng->pfnAddServerCommand((char*)"cofmp_map", Cmd_Map);
 	g_orig.pfnGameInit();
 	Log("carregado (co-op da campanha)");
 }
@@ -1750,11 +1808,16 @@ static void Hook_KeyValue(edict_t* ent, KeyValueData* kvd)
 
 static void ResetCutscene();
 static void Hook_SetView(const edict_t* client, const edict_t* view);
+static void ResetTrace();
+static bool g_netReset;
 
 static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 {
 	g_orig.pfnServerActivate(list, count, clientMax);
 
+	StopSkip("mapa novo");
+	ResetTrace();
+	g_netReset = true; // o carregamento do mapa nao conta como travada
 	g_changing = false;
 	g_gather.active = false;
 	memset(&g_arrive, 0, sizeof(g_arrive));
@@ -1900,6 +1963,11 @@ static void UnstickThink()
 }
 
 static void CamJoinThink();
+static void SkipThink();
+static void RequestSkip(int i);
+static void TraceThink();
+static void InvWatchThink();
+static void TraceDrop(edict_t* e);
 
 // ---------------------------------------------------------------- log de rede e desempenho
 //
@@ -1913,10 +1981,13 @@ static void NetStatsThink()
 	static double worst;
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
-	if (!freq.QuadPart)
+	if (!freq.QuadPart || g_netReset)
 	{
 		QueryPerformanceFrequency(&freq);
 		last = lastReport = now;
+		frames = 0;
+		worst = 0;
+		g_netReset = false;
 		return;
 	}
 	double dt = (double)(now.QuadPart - last.QuadPart) / freq.QuadPart;
@@ -1956,6 +2027,9 @@ static void Hook_StartFrame()
 	NetStatsThink();
 	if (!cv_enable.value || gpGlobals->maxClients <= 1)
 		return;
+	SkipThink();
+	TraceThink();
+	InvWatchThink();
 	BotThink();
 	HoldThink();
 	CutWaitThink();
@@ -2013,6 +2087,13 @@ static qboolean Hook_ClientConnect(edict_t* e, const char* name, const char* add
 static void Hook_ClientCommand(edict_t* e)
 {
 	int i = g_eng->pfnIndexOfEdict(e);
+	const char* name = g_eng->pfnCmd_Argv(0);
+	if (i > 0 && i < 33 && !strcmp(name, "cofmp_skip")) // Enter, mandado pela janela do Home de cada jogador
+	{
+		RequestSkip(i);
+		return;
+	}
+	bool drop = i > 0 && i < 33 && !strcmp(name, "inventorydrop");
 	if (i > 0 && i < 33)
 	{
 		struct Seen
@@ -2043,7 +2124,15 @@ static void Hook_ClientCommand(edict_t* e)
 		if (seen[i].size() > 500)
 			seen[i].clear();
 	}
+	if (!drop)
+	{
+		g_orig.pfnClientCommand(e);
+		return;
+	}
+	TraceDrop(e); // o que o hl.dll criar agora e o item jogado no chao
 	g_orig.pfnClientCommand(e);
+	TraceDrop(NULL);
+	TraceCheck("o proprio inventorydrop");
 }
 
 static void Hook_ClientDisconnect(edict_t* e)
@@ -2195,6 +2284,242 @@ static void ResetCutscene()
 	memset(g_camShared, 0, sizeof(g_camShared));
 }
 
+// ---------------------------------------------------------------- pular cutscene (Enter)
+//
+// No SP, Enter numa camera (trigger_camera sem a flag 0x400) faz o hl.dll mandar SkipScene ao cliente, que liga
+// host_framerate 2: o jogo inteiro anda 2 s por frame ate a camera desligar. No MP nada disso acontece: o hl.dll
+// so le o teclado com IsMultiplayer() falso e o Host_FilterTime do engine ignora host_framerate fora do SP.
+// Aqui a janela do Home de cada jogador manda "cmd cofmp_skip" no Enter; com uma camera ligada o servidor
+// libera o host_framerate no MP (patch no hw.dll) e liga 2 ate a camera desligar.
+
+// Host_FilterTime: if (host_framerate > 0 && (Host_IsSinglePlayerGame() || cls.demoplayback)) -> o "je" final
+// pula o host_framerate; com ele trocado por nop, vale tambem no MP.
+static const DWORD RVA_FILTER_SP_CHECK = 0x7ea3a;
+static const char SIG_FILTER_SP_CHECK[] = "\x85\xC0\x75\x09\x83\x3D????\x00\x74\x2E"; // ? = endereco de cls
+static const float SKIP_FRAMERATE = 2.0f; // o valor que o client.dll usa no SP
+static const int SF_CAMERA_NOSKIP = 0x400;
+static bool g_skipping;
+
+static bool AllowFramerateInMP(bool on)
+{
+	static BYTE* je;
+	static bool tried;
+	if (!tried)
+	{
+		tried = true;
+		BYTE* hw = (BYTE*)GetModuleHandleA("hw.dll");
+		BYTE* p = hw ? hw + RVA_FILTER_SP_CHECK : NULL;
+		if (p && SigMatch(p, SIG_FILTER_SP_CHECK, sizeof(SIG_FILTER_SP_CHECK) - 1))
+			je = p + 11;
+		else
+			Log("ERRO: Host_FilterTime do hw.dll nao confere (outra versao?) - pular cutscene desativado");
+	}
+	if (!je)
+		return false;
+	const BYTE want[2] = { BYTE(on ? 0x90 : 0x74), BYTE(on ? 0x90 : 0x2E) };
+	DWORD old;
+	if (!VirtualProtect(je, 2, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	memcpy(je, want, 2);
+	VirtualProtect(je, 2, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), je, 2);
+	return true;
+}
+
+static void StopSkip(const char* why)
+{
+	if (!g_skipping)
+		return;
+	g_skipping = false;
+	g_eng->pfnCVarSetFloat("host_framerate", 0);
+	AllowFramerateInMP(false);
+	Log("cutscene: fim do pulo (%s)", why);
+}
+
+static void RequestSkip(int i)
+{
+	edict_t* p = PlayerAt(i);
+	if (!p || g_changing || g_skipping || !cv_enable.value || gpGlobals->maxClients <= 1)
+		return;
+	if (!g_camOwner || IsNull(g_camView))
+	{
+		Note("jogador %d apertou Enter sem cutscene", i);
+		return;
+	}
+	if (g_camView->v.spawnflags & SF_CAMERA_NOSKIP)
+	{
+		g_eng->pfnClientPrintf(p, print_center, "Esta cena nao pode ser pulada");
+		return;
+	}
+	if (!AllowFramerateInMP(true))
+		return;
+	g_skipping = true;
+	g_eng->pfnCVarSetFloat("host_framerate", SKIP_FRAMERATE);
+	Log("cutscene: '%s' pulou a camera '%s'", STRING(p->v.netname), STRING(g_camView->v.targetname));
+}
+
+// Cameras encadeadas desligam e ligam no mesmo frame: o pulo segue ate nao sobrar camera.
+static void SkipThink()
+{
+	if (g_skipping && !g_camOwner)
+		StopSkip("camera desligou");
+}
+
+// ---------------------------------------------------------------- rastreio de itens (diagnostico)
+//
+// Itens jogados no chao que somem e itens pegos que nao entram no inventario: o log ganha cada mudanca no
+// inventario dos jogadores e o destino do que um inventorydrop cria (onde nasceu, quem apagou e quando).
+
+struct Traced
+{
+	edict_t* e;
+	int serial;
+	int index;
+	float until;
+	std::string cls;
+};
+static std::vector<Traced> g_traced;
+static edict_t* g_dropper; // dentro de um inventorydrop: o que o hl.dll criar e o item jogado no chao
+
+static void TraceDrop(edict_t* e)
+{
+	g_dropper = e;
+}
+
+static void TraceAdd(edict_t* e)
+{
+	if (!g_dropper || !e || g_traced.size() >= 16)
+		return;
+	g_traced.push_back({ e, e->serialnumber, g_eng->pfnIndexOfEdict(e), gpGlobals->time + 10.0f, "" });
+	g_tracing = true;
+}
+
+static edict_t* Hook_CreateEntity()
+{
+	edict_t* e = g_eng->pfnCreateEntity();
+	TraceAdd(e);
+	return e;
+}
+
+static edict_t* Hook_CreateNamedEntity(int className)
+{
+	edict_t* e = g_eng->pfnCreateNamedEntity(className);
+	TraceAdd(e);
+	return e;
+}
+
+static void Hook_RemoveEntity(edict_t* e)
+{
+	for (size_t k = 0; k < g_traced.size(); k++)
+		if (g_traced[k].e == e && e->serialnumber == g_traced[k].serial)
+		{
+			Log("item #%d '%s': apagado (REMOVE_ENTITY chamado de hl.dll+0x%x)", g_traced[k].index,
+				g_traced[k].cls.empty() ? STRING(e->v.classname) : g_traced[k].cls.c_str(),
+				(unsigned)((DWORD)_ReturnAddress() - (DWORD)g_hl));
+			g_traced.erase(g_traced.begin() + k);
+			break;
+		}
+	g_tracing = !g_traced.empty();
+	g_eng->pfnRemoveEntity(e);
+}
+
+static void TraceCheck(const char* during)
+{
+	for (size_t k = 0; k < g_traced.size();)
+	{
+		Traced& t = g_traced[k];
+		edict_t* e = t.e;
+		const char* why = NULL;
+		if (e->free || e->serialnumber != t.serial)
+			why = "liberado";
+		else if (e->v.flags & FL_KILLME)
+			why = "marcado para apagar (UTIL_Remove)";
+		if (t.cls.empty() && !why)
+		{
+			// primeira olhada, logo depois do inventorydrop: como o item nasceu
+			t.cls = STRING(e->v.classname);
+			Log("item #%d '%s' criado no chao: modelo '%s' em %.0f %.0f %.0f, solid %d, movetype %d, effects %d, dono #%d",
+				t.index, t.cls.c_str(), STRING(e->v.model), e->v.origin.x, e->v.origin.y, e->v.origin.z, e->v.solid,
+				e->v.movetype, e->v.effects, e->v.owner ? g_eng->pfnIndexOfEdict(e->v.owner) : 0);
+		}
+		if (why)
+		{
+			Log("item #%d '%s': %s durante %s", t.index, t.cls.empty() ? "?" : t.cls.c_str(), why, during);
+			g_traced.erase(g_traced.begin() + k);
+			continue;
+		}
+		k++;
+	}
+	g_tracing = !g_traced.empty();
+}
+
+static void TraceThink()
+{
+	if (!g_tracing)
+		return;
+	TraceCheck("o frame (fora de think/touch)");
+	for (size_t k = 0; k < g_traced.size();)
+	{
+		Traced& t = g_traced[k];
+		if (gpGlobals->time < t.until)
+		{
+			k++;
+			continue;
+		}
+		edict_t* e = t.e;
+		Log("item #%d '%s' continua no chao depois de 10 s em %.0f %.0f %.0f (effects %d)", t.index, t.cls.c_str(),
+			e->v.origin.x, e->v.origin.y, e->v.origin.z, e->v.effects);
+		g_traced.erase(g_traced.begin() + k);
+	}
+	g_tracing = !g_traced.empty();
+}
+
+static void ResetTrace()
+{
+	g_traced.clear();
+	g_tracing = false;
+	g_dropper = NULL;
+}
+
+// Inventario de cada jogador (os 7 slots e as armas): uma linha no log a cada mudanca.
+static void InvWatchThink()
+{
+	static std::string last[33];
+	static float next;
+	if (gpGlobals->time < next && gpGlobals->time > next - 1.0f)
+		return;
+	next = gpGlobals->time + 0.2f;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || !IsAlive(p) || (p->v.flags & FL_FAKECLIENT))
+		{
+			last[i].clear();
+			continue;
+		}
+		void* pl = p->pvPrivateData;
+		std::string s = "slots:";
+		for (int k = 0; k < 7; k++)
+		{
+			int str = Field<int>(pl, OFS_INV_SLOT + k * 4);
+			s += " ";
+			s += str && *STRING(str) ? ItemName(STRING(str)) : "-";
+		}
+		s += " | armas:";
+		ForEachItem(pl, [&](void* it) {
+			entvars_t* pev = PevOf(it);
+			if (pev && pev->classname)
+				s += std::string(" ") + STRING(pev->classname);
+		});
+		if (s != last[i])
+		{
+			if (!last[i].empty())
+				Note("jogador %d inventario %s", i, s.c_str());
+			last[i] = s;
+		}
+	}
+}
+
 // ---------------------------------------------------------------- dump de crash
 //
 // O crashhandler da Steam as vezes morre junto com o jogo e nao salva nada. Na primeira excecao
@@ -2269,6 +2594,9 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 		return;
 	g_engForHL = *eng;
 	g_engForHL.pfnSetView = Hook_SetView;
+	g_engForHL.pfnCreateEntity = Hook_CreateEntity;
+	g_engForHL.pfnCreateNamedEntity = Hook_CreateNamedEntity;
+	g_engForHL.pfnRemoveEntity = Hook_RemoveEntity;
 	typedef void(__stdcall * fn_t)(enginefuncs_t*, globalvars_t*);
 	((fn_t)GetProcAddress(g_hl, "GiveFnptrsToDll"))(&g_engForHL, globals);
 }

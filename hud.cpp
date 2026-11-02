@@ -31,7 +31,7 @@ static std::string g_cry, g_tunnelDir;
 static DWORD g_codeStart;
 static HFONT g_font, g_bold;
 
-enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS, ID_GO };
+enum { ID_PLAYERS = 100, ID_MAP, ID_HOST, ID_CODE, ID_COPY, ID_JOIN_CODE, ID_PASTE, ID_JOIN, ID_STATUS, ID_GO, ID_CHANGE };
 enum { WM_HUD_CMD = WM_APP + 0x43 };
 enum { TIMER_POLL = 1, TIMER_CODE, TIMER_CONNECT };
 static const int TUNNEL_PORT = 27020;
@@ -212,9 +212,9 @@ static void ShowHud(bool show)
 		SetDlgItemTextA(g_hud, ID_JOIN_CODE, clip.c_str());
 }
 
-static void DoHost()
+// nome do mapa escolhido, sem ".bsp"; vazio (e aviso no status) se for invalido
+static std::string MapName()
 {
-	int players = 2 + (int)SendDlgItemMessageW(g_hud, ID_PLAYERS, CB_GETCURSEL, 0, 0);
 	std::string map = ItemText(ID_MAP);
 	if (map.size() > 4 && !_stricmp(map.c_str() + map.size() - 4, ".bsp"))
 		map.resize(map.size() - 4);
@@ -222,8 +222,17 @@ static void DoHost()
 			std::string::npos)
 	{
 		Status(L"Nome de mapa inválido.");
-		return;
+		return "";
 	}
+	return map;
+}
+
+static void DoHost()
+{
+	int players = 2 + (int)SendDlgItemMessageW(g_hud, ID_PLAYERS, CB_GETCURSEL, 0, 0);
+	std::string map = MapName();
+	if (map.empty())
+		return;
 	SetDlgItemTextA(g_hud, ID_CODE, "");
 	DeleteFileA((g_tunnelDir + "\\codigo.txt").c_str());
 	bool tunnel = StartTunnel("host");
@@ -240,6 +249,17 @@ static void DoHost()
 	Status(L"Abrindo o servidor e o túnel da Steam...");
 	g_codeStart = GetTickCount();
 	SetTimer(g_hud, TIMER_CODE, 250, NULL);
+}
+
+// so o mapa: o servidor, o tunel e quem esta conectado continuam (cofmp_map leva o inventario junto)
+static void DoChangeMap()
+{
+	std::string map = MapName();
+	if (map.empty())
+		return;
+	Queue(("cofmp_map " + map + "\n").c_str());
+	Status(L"Trocando de mapa. Só funciona com o servidor aberto por você (Criar servidor).");
+	ShowHud(false);
 }
 
 // o tunel grava o codigo em codigo.txt assim que fala com a Steam
@@ -328,6 +348,7 @@ static void Connect()
 // seringa) quando o nome do mapa tem "cof_" (os mapas c_cof_*). Trocamos o texto que ele procura
 // pelo nosso: vazio (vale qualquer mapa) quando o jogo tem mais de um jogador, "cof_" no single player.
 static char g_coopTag[8] = "cof_";
+static bool g_inMP; // o cliente esta num jogo com mais de um jogador
 static const DWORD RVA_PANEL_PUSH = 0x3c66c;  // push "cof_" antes do strstr(GetLevelName(), ...)
 static const DWORD RVA_COF_STR = 0x14688c;
 static const DWORD RVA_GETMAXCLIENTS = 0x1b2698; // gEngfuncs.GetMaxClients (copia do client.dll)
@@ -359,6 +380,7 @@ static void CoopPanelThink()
 	typedef int (*GetMaxClients_t)();
 	GetMaxClients_t maxClients = *(GetMaxClients_t*)(base + RVA_GETMAXCLIENTS);
 	bool mp = maxClients && maxClients() > 1;
+	g_inMP = mp;
 	if (mp && g_coopTag[0])
 		g_coopTag[0] = 0;
 	else if (!mp && !g_coopTag[0])
@@ -367,18 +389,22 @@ static void CoopPanelThink()
 
 static void Poll()
 {
-	static bool homeDown;
+	static bool homeDown, enterDown;
 	CoopPanelThink();
 	AttachGame();
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	GetWindowThreadProcessId(fg, &pid);
+	bool inGame = pid == GetCurrentProcessId();
 	bool down = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
-	if (down && !homeDown)
-	{
-		DWORD pid = 0;
-		GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-		if (pid == GetCurrentProcessId())
-			ShowHud(!IsWindowVisible(g_hud));
-	}
+	if (down && !homeDown && inGame)
+		ShowHud(!IsWindowVisible(g_hud));
 	homeDown = down;
+	// Enter pula a cutscene, como no SP; no MP o hl.dll nao le o teclado, entao o pedido vai para o servidor
+	bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+	if (enter && !enterDown && inGame && fg != g_hud && g_inMP)
+		Queue("cmd cofmp_skip\n");
+	enterDown = enter;
 }
 
 static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -401,6 +427,9 @@ static LRESULT CALLBACK HudProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			break;
 		case ID_JOIN:
 			DoJoin();
+			break;
+		case ID_CHANGE:
+			DoChangeMap();
 			break;
 		case ID_GO: // o mapa espera o grupo antes de rodar as cutscenes; aqui o host comeca sem esperar
 			Queue("cofmp_go\n");
@@ -492,8 +521,9 @@ static void CreateHud()
 		FindClose(fh);
 	}
 	SetWindowTextA(map, "c_intro"); // comeco do jogo, com a cutscene
-	Ctl(L"BUTTON", L"Criar servidor", B, 22, 94, 200, 28, ID_HOST);
-	Ctl(L"BUTTON", L"Começar agora", B, 228, 94, 127, 28, ID_GO);
+	Ctl(L"BUTTON", L"Criar servidor", B, 22, 94, 112, 28, ID_HOST);
+	Ctl(L"BUTTON", L"Trocar mapa", B, 139, 94, 104, 28, ID_CHANGE);
+	Ctl(L"BUTTON", L"Começar agora", B, 248, 94, 107, 28, ID_GO);
 	Ctl(L"STATIC", L"Código:", SC, 22, 132, 50, 23, 0);
 	Ctl(L"EDIT", L"", E | ES_READONLY, 75, 132, 200, 23, ID_CODE);
 	Ctl(L"BUTTON", L"Copiar", B, 282, 132, 73, 23, ID_COPY);

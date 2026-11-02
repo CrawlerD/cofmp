@@ -68,11 +68,14 @@ Os outros jogadores abrem o Cry of Fear e digitam no console (tecla `'`) `connec
 Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partida).
 - **Hospedar:** escolha o número de jogadores e o mapa (padrão: 2 e `c_intro`) e clique em "Criar servidor". A DLL roda `disconnect; sv_lan 1; sv_lan_rate 100000; maxplayers N; map X`, abre o túnel em modo host e mostra o código, que já vai para a área de transferência.
 - **Entrar:** cole o código (se ele já estiver copiado, aparece sozinho) e clique em "Entrar". Quando o túnel do host responde, a DLL roda `rate 100000; cl_cmdrate 60; cl_updaterate 30; connect 127.0.0.1:27020`.
+- **Trocar mapa (v1.10):** com o servidor já aberto, roda `cofmp_map <mapa>`: troca de mapa sem fechar o servidor, levando o inventário de cada jogador.
 - **Começar agora:** roda `cofmp_go`, que solta a espera do grupo ou da cutscene (abaixo) sem aguardar os outros.
 
 **Sem VAC (v1.8):** no `hw.dll`, o servidor é seguro quando não há `-insecure` na linha de comando e `sv_lan` é 0. Por isso o servidor do Home abre com `sv_lan 1`. O amigo chega pelo túnel como 127.0.0.1, que conta como LAN, e entra normalmente. Por IP direto da internet não entra com `sv_lan 1`: para isso use o instalador (opção 3), que abre o jogo com `-insecure`. Com `sv_lan 1`, a banda de cada cliente é limitada por `sv_lan_rate`, que vale 20000 por padrão; o Home sobe para 100000.
 
 **Espera antes das cutscenes (v1.8):** no `ServerActivate`, a DLL procura os `trigger_once`/`trigger_multiple` cuja cadeia de alvos (`target`, chaves do `multi_manager`, `trigger_relay`, até 6 níveis) chega numa `trigger_camera`. Ficam de fora os gatilhos com `master` (podem estar travados) e os com a flag "no clients". Quem toca um desses primeiro fica congelado e imortal dentro dele, e o toque é segurado. Quando todos os humanos do servidor estão vivos a até 96 unidades do gatilho, o `Touch` é chamado com o primeiro que chegou. Quem está morto também conta, então o grupo espera essa pessoa renascer. O host pode soltar antes com `cofmp_go`. Enquanto uma `trigger_camera` está ligada, todos ficam imortais: `takedamage` vai para `DAMAGE_NO`, `FL_GODMODE` liga e a vida não cai. Os valores de antes voltam quando a câmera desliga. Desliga com `cofmp_cutscene_wait 0`. Com `2`, os bots também contam, para testar sozinho.
+
+**Pular cutscene no co-op (v1.10):** no single player o `hl.dll` só pula a cena com Enter quando não é multiplayer, e o pulo é `host_framerate 2`, que o motor ignora em multiplayer. No co-op o Enter (com o jogo em primeiro plano) manda `cofmp_skip`; o servidor confere se há uma `trigger_camera` ligada sem a flag 0x400 ("não pode pular"), libera `host_framerate` no `hw.dll` (RVA 0x7ea45, `74 2E` → `90 90`) e põe 2 até a câmera desligar ou o mapa trocar.
 
 **Log (v1.8):** o `cofmp.dll` e o túnel escrevem em `cryoffear\Mod coop\cofmp_log.txt` (até a v1.8, `cryoffear\cofmp_log.txt`), com as tags `[jogo]` e `[tunel]`. Passando de 5 MB, o arquivo vira `cofmp_log_anterior.txt`. O log tem:
 - tudo o que sai como `[cofmp]` no console;
@@ -120,6 +123,8 @@ Se o jogo crashar com o mod carregado (no PC de quem hospeda), o mod grava `cryo
 | `cofmp_respawn_time 30` | segundos até o jogador caído renascer sozinho perto do grupo, se ninguém reviver (0 = só por revive ou pulando) |
 | `cofmp_cutscene_wait 1` | 1 = gatilho de cutscene espera todos chegarem perto (quem chega fica parado e imortal); 0 = desliga; 2 = conta bots também (testes) |
 | `cofmp_go` | solta a espera do começo do mapa ou da cutscene sem aguardar os outros (Home > Começar agora) |
+| `cofmp_map <mapa>` | troca o servidor para outro mapa levando o inventário (Home > Trocar mapa) |
+| `cofmp_skip` | pula a cutscene atual, como o Enter do single player (o Enter manda isso no co-op) |
 | `cofmp_debug` | estado dos slots de jogador |
 | `cofmp_inv` | chaveiro do grupo, armas, munição e slots de inventário de cada jogador |
 | `cofmp_bot [nome]` | cria um bot parado (testes com 1 pessoa só) |

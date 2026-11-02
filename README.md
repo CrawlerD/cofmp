@@ -117,6 +117,20 @@ As duas janelas do túnel ficam abertas enquanto jogam. Também dá para rodar d
 ### Crashes
 Se o jogo crashar com o mod carregado (no PC de quem hospeda), o mod grava `cryoffear\Mod coop\cofmp_crash_<data>.dmp`. Mande esse arquivo para análise.
 
+Se o jogo parar de rodar frames por 8 s ou mais, um vigia (thread separada) anota no log a pilha da thread principal e as janelas do jogo. Aos 30, 90 e 180 s ele também anota quantos frames o servidor rodou. Com `COFMP_PRINT=1` no ambiente, o vigia tira prints em etapas, desligando grupos de efeitos de tela, e testa a apresentação do OpenGL de quatro jeitos. Isso serve para diagnosticar tela preta.
+
+### Tela preta em placas AMD
+Na Radeon integrada (Ryzen 5 5500U, Adrenalin 26.5.2), o Cry of Fear fica com a tela preta depois da intro, mesmo sem o mod. O jogo desenha certo no buffer de trás, mas a imagem enviada pelo `wglSwapBuffers` do driver não chega à tela. Já desenhar direto no buffer da frente aparece. Quando a placa é AMD (`GL_VENDOR` com ATI ou AMD), o mod desvia o `wglSwapBuffers` do `opengl32.dll` carregado pelo jogo. Em vez de trocar os buffers, ele copia o buffer de trás para o da frente (`glBlitFramebuffer`) e chama `glFinish`. Com `COFMP_FRENTE=1` o desvio liga em qualquer placa; com `COFMP_FRENTE=0`, desliga.
+
+### Roteiro de teste com 2 jogadores
+O roteiro é o arquivo `cryoffear\Mod coop\teste.txt` ou o indicado em `COFMP_TESTE`, carregado ao abrir o jogo. Também dá para carregar com `cofmp_teste [arquivo]` no console do host. Cada linha tem o formato `segundos [jN] comando` e vai ao console do jogador N como se ele digitasse; as linhas do jogador 2 rodam no PC dele. A contagem começa quando todos os jogadores do roteiro estão vivos. O mod tem comandos próprios para o roteiro:
+- `!olhar P`: muda o ângulo vertical da visão (positivo = para baixo).
+- `!criar classe`: cria um item novo 48 unidades à frente.
+- `!usar`: usa o item mais perto com o botão Usar apertado.
+- `!aviso texto`: mostra o texto no meio da tela do jogador.
+
+Apague o `teste.txt` depois do teste, senão ele roda em toda partida.
+
 ## Cvars e comandos (servidor)
 | | |
 |---|---|

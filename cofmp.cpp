@@ -12,6 +12,7 @@
 
 #include "extdll.h"
 #include <intrin.h>
+#include <psapi.h>
 #include <algorithm>
 #include <string>
 #include <unordered_map>
@@ -1228,6 +1229,8 @@ static void Cmd_Use()
 	g_orig.pfnUse(best, user);
 }
 
+static void Cmd_Teste(); // roteiro de teste, perto do TestScriptThink
+
 // cofmp_after <segundos> <comando>: roda o comando no console do servidor depois do tempo (roteiros de teste)
 static std::vector<std::pair<double, std::string>> g_after;
 
@@ -1785,6 +1788,7 @@ static void Hook_GameInit()
 	g_eng->pfnAddServerCommand((char*)"cofmp_after", Cmd_After);
 	g_eng->pfnAddServerCommand((char*)"cofmp_go", Cmd_Go);
 	g_eng->pfnAddServerCommand((char*)"cofmp_map", Cmd_Map);
+	g_eng->pfnAddServerCommand((char*)"cofmp_teste", Cmd_Teste);
 	g_orig.pfnGameInit();
 	Log("carregado (co-op da campanha)");
 }
@@ -1979,6 +1983,8 @@ static void FloorWatchThink();
 static void ViewFixThink();
 static void FlashLog(edict_t* e);
 static void ResetFloor();
+static void TestScriptThink();
+static void WatchBeat();
 static void TraceDrop(edict_t* e);
 static void DropCommand(edict_t* e);
 
@@ -2034,6 +2040,7 @@ static void NetStatsThink()
 
 static void Hook_StartFrame()
 {
+	WatchBeat();
 	Hud_RunPending();
 	g_orig.pfnStartFrame();
 	AfterThink();
@@ -2041,6 +2048,7 @@ static void Hook_StartFrame()
 	if (!cv_enable.value || gpGlobals->maxClients <= 1)
 		return;
 	SkipThink();
+	TestScriptThink();
 	TraceThink();
 	InvWatchThink();
 	FloorWatchThink();
@@ -2087,6 +2095,7 @@ static void Hook_ClientPutInServer(edict_t* e)
 	g_orig.pfnClientPutInServer(e);
 	ForceModel(e, g_eng->pfnGetInfoKeyBuffer(e));
 	Log("jogador %d '%s' entrou no mapa", g_eng->pfnIndexOfEdict(e), STRING(e->v.netname));
+	WatchBeat();
 }
 
 static qboolean Hook_ClientConnect(edict_t* e, const char* name, const char* addr, char reject[128])
@@ -2508,6 +2517,13 @@ static std::string SlotsOf(void* pl)
 	return s;
 }
 
+// m_pfnThink/Touch/Use (+0x78/+0x7c/+0x80) como endereco do hl.dll sem relocacao, para achar no disassembly
+static unsigned HlAddr(edict_t* e, int ofs)
+{
+	unsigned p = e->pvPrivateData ? Field<unsigned>(e->pvPrivateData, ofs) : 0;
+	return p && g_hl ? p - (unsigned)(size_t)g_hl + 0x10000000 : p;
+}
+
 // estado de uma arma/item no log: onde esta, se aparece e o que o hl.dll olha no drop e no pegar
 static std::string Describe(edict_t* e)
 {
@@ -2521,13 +2537,14 @@ static std::string Describe(edict_t* e)
 	void* holder = weapon ? Field<void*>(e->pvPrivateData, OFS_ITEM_PLAYER) : NULL;
 	_snprintf(buf, sizeof(buf) - 1,
 		"#%d '%s' livre %d modelo '%s' (%d) arquivo '%s' effects %d solid %d movetype %d iuser3 %d iuser4 %d "
-		"target '%s' spawnflags 0x%x flags 0x%x armor %.0f dono #%d aiment #%d m_pPlayer #%d em %.0f %.0f %.0f",
+		"target '%s' spawnflags 0x%x flags 0x%x armor %.0f dono #%d aiment #%d m_pPlayer #%d em %.0f %.0f %.0f "
+		"think %x touch %x use %x",
 		g_eng->pfnIndexOfEdict(e), STRING(v->classname), e->free, v->model ? STRING(v->model) : "", v->modelindex,
 		file ? STRING(file) : "", v->effects, v->solid, v->movetype, v->iuser3, v->iuser4,
 		v->target ? STRING(v->target) : "", v->spawnflags, v->flags, v->armorvalue,
 		v->owner ? g_eng->pfnIndexOfEdict(v->owner) : 0, v->aiment ? g_eng->pfnIndexOfEdict(v->aiment) : 0,
 		holder && PevOf(holder) ? g_eng->pfnIndexOfEdict(PevOf(holder)->pContainingEntity) : 0, v->origin.x,
-		v->origin.y, v->origin.z);
+		v->origin.y, v->origin.z, HlAddr(e, 0x78), HlAddr(e, 0x7c), HlAddr(e, 0x80));
 	buf[sizeof(buf) - 1] = 0;
 	return buf;
 }
@@ -2723,6 +2740,144 @@ static void FloorWatchThink()
 	}
 }
 
+// Roteiro de teste: arquivo de linhas "segundos [jN] comando". Cada comando vai ao console do jogador N (padrao 1),
+// como se ele digitasse; no jogador 2 (o amigo) roda no PC dele. A contagem comeca quando todos os jogadores do
+// roteiro estao vivos. Carrega ao abrir o jogo (da variavel de ambiente COFMP_TESTE ou, se existir,
+// Mod coop\teste.txt) ou com "cofmp_teste [arquivo]" no console do host (padrao: Mod coop\teste.txt).
+// Comandos do mod: !olhar P (angulo vertical, positivo = baixo), !criar classe (item novo 48 unidades a frente),
+// !usar (usa o item mais perto com o botao Usar apertado), !aviso texto (no meio da tela do jogador).
+struct TestStep
+{
+	float at;
+	int who;
+	std::string cmd;
+};
+static std::vector<TestStep> g_test;
+static float g_testStart;
+static std::string g_modDir;
+
+static void LoadTestScript(const char* path, bool quiet = false)
+{
+	g_test.clear();
+	g_testStart = 0;
+	FILE* f = fopen(path, "r");
+	if (!f)
+	{
+		if (!quiet)
+			Log("teste: nao abriu %s", path);
+		return;
+	}
+	char line[256];
+	while (fgets(line, sizeof(line), f))
+	{
+		char* cmd = NULL;
+		float at = (float)strtod(line, &cmd);
+		int who = 1;
+		while (*cmd == ' ' || *cmd == '\t')
+			cmd++;
+		if ((*cmd == 'j' || *cmd == 'J') && cmd[1] >= '1' && cmd[1] <= '9' && cmd[2] == ' ')
+		{
+			who = cmd[1] - '0';
+			for (cmd += 3; *cmd == ' ' || *cmd == '\t'; cmd++)
+				;
+		}
+		size_t n = strcspn(cmd, "\r\n");
+		if (n && *line != '/')
+			g_test.push_back({ at, who, std::string(cmd, n) });
+	}
+	fclose(f);
+	Log("teste: %d comando(s) de %s", (int)g_test.size(), path);
+}
+
+static void Cmd_Teste()
+{
+	std::string path = g_eng->pfnCmd_Argc() > 1 ? g_eng->pfnCmd_Argv(1) : g_modDir + "\\teste.txt";
+	LoadTestScript(path.c_str());
+}
+
+static void TestStepRun(const TestStep& s, edict_t* p)
+{
+	const std::string& cmd = s.cmd;
+	Log("teste: %.1f s: jogador %d: %s", s.at, s.who, cmd.c_str());
+	if (!strncmp(cmd.c_str(), "!olhar ", 7))
+	{
+		p->v.angles.x = p->v.v_angle.x = (float)atof(cmd.c_str() + 7);
+		p->v.fixangle = 1;
+	}
+	else if (!strncmp(cmd.c_str(), "!criar ", 7))
+	{
+		edict_t* w = g_eng->pfnCreateNamedEntity(EngString(cmd.c_str() + 7));
+		if (IsNull(w))
+			return;
+		float yaw = p->v.v_angle.y * 3.14159265f / 180.0f;
+		w->v.origin = p->v.origin + Vector(cosf(yaw) * 48, sinf(yaw) * 48, 0);
+		g_orig.pfnSpawn(w);
+		g_eng->pfnDropToFloor(w);
+		Log("teste: criada %s", Describe(w).c_str());
+	}
+	else if (!strncmp(cmd.c_str(), "!aviso ", 7))
+		g_eng->pfnClientPrintf(p, print_center, (cmd.substr(7) + "\n").c_str());
+	else if (cmd == "!usar")
+	{
+		edict_t* best = NULL;
+		for (edict_t* e = g_eng->pfnFindEntityInSphere(NULL, p->v.origin, 96); !IsNull(e);
+			 e = g_eng->pfnFindEntityInSphere(e, p->v.origin, 96))
+			if (e->pvPrivateData && IsLoot(e) && OnFloor(e) && !e->v.owner)
+				best = e;
+		if (!best)
+		{
+			Log("teste: nenhum item no chao perto do jogador %d", s.who);
+			return;
+		}
+		std::string before = SlotsOf(p->pvPrivateData), desc = Describe(best);
+		int serial = best->serialnumber;
+		p->v.button |= IN_USE; // o hl.dll so deixa pegar com o Usar apertado
+		g_orig.pfnUse(best, p);
+		p->v.button &= ~IN_USE;
+		Log("teste: usou %s; slots [%s] -> [%s]; item depois: %s", desc.c_str(), before.c_str(),
+			SlotsOf(p->pvPrivateData).c_str(),
+			best->free || best->serialnumber != serial ? "liberado" : Describe(best).c_str());
+	}
+	else
+		g_eng->pfnClientCommand(p, (char*)"%s\n", cmd.c_str());
+}
+
+static void TestScriptThink()
+{
+	static bool fromEnv;
+	if (!fromEnv)
+	{
+		fromEnv = true;
+		if (const char* path = getenv("COFMP_TESTE"))
+			LoadTestScript(path);
+		else
+			LoadTestScript((g_modDir + "\\teste.txt").c_str(), true);
+	}
+	if (g_test.empty())
+		return;
+	if (!g_testStart)
+	{
+		for (const TestStep& s : g_test)
+		{
+			edict_t* p = PlayerAt(s.who);
+			if (!p || !IsAlive(p))
+				return;
+		}
+		g_testStart = gpGlobals->time;
+		Log("teste: comecou");
+	}
+	while (!g_test.empty() && gpGlobals->time - g_testStart >= g_test.front().at)
+	{
+		TestStep s = g_test.front();
+		g_test.erase(g_test.begin());
+		edict_t* p = PlayerAt(s.who);
+		if (p)
+			TestStepRun(s, p);
+		else
+			Log("teste: %.1f s: jogador %d nao esta no jogo; pulando '%s'", s.at, s.who, s.cmd.c_str());
+	}
+}
+
 static void ResetFloor()
 {
 	g_floor.clear();
@@ -2842,6 +2997,651 @@ static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* ep)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ---------------------------------------------------------------- vigia de travamento
+//
+// Se o servidor passa 8 s sem rodar um frame (jogo travado, ou so carregando), anota no log onde a thread
+// principal esta: EIP e os enderecos de retorno achados na pilha, como modulo+deslocamento. Repete com 16, 32,
+// 64 e 128 s parado. Com a thread suspensa so copia a pilha (nada que pegue lock); os nomes dos modulos vem do
+// K32EnumProcessModules, que le a lista do PEB sem o loader lock. Aos 30, 90 e 180 s de jogo anota tambem quantos
+// frames o servidor rodou e as janelas do jogo (para o caso de tela parada com o jogo rodando por tras).
+
+static HANDLE g_mainThread;
+static volatile LONG g_watchBeat;
+
+// COFMP_PRINT=1 (posto pelos .bat de diagnostico): o vigia tira um print do jogo a cada etapa e desliga mais um
+// grupo de efeitos de tela, para achar qual deixa a tela toda preta (placas AMD). Os comandos tem que rodar na
+// thread do jogo, entao vao aqui. g_watchShot = numero da etapa + 1.
+static volatile LONG g_watchShot;
+
+static const char* const g_watchCvars[] = { "gl_renderer", "gl_posteffects", "gl_grayscale", "gl_screenblur",
+	"gl_glows", "gl_noshaders", "gl_bump", "gl_specular", "gl_highspecular", "gl_dynlight", "gl_blurtest",
+	"cl_vignette", "cl_noiseeffect", "gl_brightness", "gl_contrast", "gl_gamma", "gl_opacity" };
+static const char* const g_watchSteps[] = {
+	"gl_posteffects 0; gl_grayscale 0",
+	"gl_screenblur 0; gl_glows 0; cl_vignette 0; cl_noiseeffect 0",
+	"gl_noshaders 1; gl_bump 0; gl_specular 0; gl_highspecular 0; gl_dynlight 0",
+	"gl_renderer 0",
+};
+static const int WATCH_STEPS = sizeof(g_watchSteps) / sizeof(g_watchSteps[0]) + 1;
+// valores dos cvars antes das etapas, devolvidos no fim (varios sao salvos no config.cfg ao sair)
+static char g_watchRestore[400];
+
+// Teste do OpenGL, chamado na thread do jogo (o contexto do OpenGL esta ativo nela): anota o formato de pixel e o
+// estado que o jogo deixou; com red, pinta a tela de vermelho direto (glClear + SwapBuffers). Junto com a foto da
+// janela como o Windows mostra (WatchSaveWindow), separa "o jogo desenha preto" de "o desenho nao chega na tela".
+// As funcoes vem do opengl32.dll que o jogo carregou (o do Paranoia, na pasta do jogo), por GetProcAddress.
+#define GL_FN(ret, name, args) ret(WINAPI* name) args = (ret(WINAPI*) args)GetProcAddress(gl, #name)
+static void WatchSaveWindow(HWND w, const char* file);
+static void WatchHooks();
+struct WatchMod { DWORD base, size; char name[48]; };
+static int WatchModules(WatchMod* out, int max);
+static int WatchName(char* buf, int size, const WatchMod* m, int n, DWORD a);
+
+static void WatchGL(bool red)
+{
+	char buf[1000];
+	HMODULE gl = GetModuleHandleA("opengl32.dll");
+	if (!gl)
+	{
+		LogFile_Write("trava", "opengl: opengl32.dll nao carregado");
+		return;
+	}
+	char glPath[MAX_PATH] = "";
+	GetModuleFileNameA(gl, glPath, sizeof(glPath));
+	GL_FN(HGLRC, wglGetCurrentContext, ());
+	GL_FN(HDC, wglGetCurrentDC, ());
+	GL_FN(BOOL, wglSwapBuffers, (HDC));
+	GL_FN(const char*, glGetString, (unsigned));
+	GL_FN(void, glGetIntegerv, (unsigned, int*));
+	GL_FN(void, glGetFloatv, (unsigned, float*));
+	GL_FN(unsigned char, glIsEnabled, (unsigned));
+	GL_FN(unsigned, glGetError, ());
+	GL_FN(void, glReadBuffer, (unsigned));
+	GL_FN(void, glReadPixels, (int, int, int, int, unsigned, unsigned, void*));
+	GL_FN(void, glDisable, (unsigned));
+	GL_FN(void, glEnable, (unsigned));
+	GL_FN(void, glColorMask, (unsigned char, unsigned char, unsigned char, unsigned char));
+	GL_FN(void, glClearColor, (float, float, float, float));
+	GL_FN(void, glClear, (unsigned));
+	GL_FN(void, glFinish, ());
+	if (!wglGetCurrentContext || !wglGetCurrentDC || !wglSwapBuffers || !glGetString || !glGetIntegerv ||
+		!glGetFloatv || !glIsEnabled || !glGetError || !glReadBuffer || !glReadPixels || !glDisable || !glEnable ||
+		!glColorMask || !glClearColor || !glClear || !glFinish)
+	{
+		snprintf(buf, sizeof(buf), "opengl: faltam funcoes em %s", glPath);
+		LogFile_Write("trava", buf);
+		return;
+	}
+	HGLRC rc = wglGetCurrentContext();
+	HDC dc = wglGetCurrentDC();
+	HWND w = dc ? WindowFromDC(dc) : NULL;
+	if (!rc || !dc)
+	{
+		snprintf(buf, sizeof(buf), "opengl: sem contexto ativo nesta thread (contexto %p, dc %p, %s)", rc, dc, glPath);
+		LogFile_Write("trava", buf);
+		return;
+	}
+	unsigned err0 = glGetError();
+	while (glGetError()) {}
+	int vp[4] = {}, drawBuf = 0, readBuf = 0, fbo = -1, mask[4] = {}, bits[6] = {};
+	float color[4] = {}, clear[4] = {};
+	glGetIntegerv(0x0BA2, vp);   // GL_VIEWPORT
+	glGetIntegerv(0x0C01, &drawBuf);  // GL_DRAW_BUFFER
+	glGetIntegerv(0x0C02, &readBuf);  // GL_READ_BUFFER
+	glGetIntegerv(0x0C23, mask);      // GL_COLOR_WRITEMASK
+	glGetIntegerv(0x8CA6, &fbo);      // GL_FRAMEBUFFER_BINDING (erro se nao tiver FBO)
+	for (int i = 0; i < 6; i++)       // GL_RED/GREEN/BLUE/ALPHA/DEPTH/STENCIL_BITS
+		glGetIntegerv(i < 4 ? 0x0D52 + i : i == 4 ? 0x0D56 : 0x0D57, &bits[i]);
+	glGetFloatv(0x0B00, color);       // GL_CURRENT_COLOR
+	glGetFloatv(0x0C22, clear);       // GL_COLOR_CLEAR_VALUE
+	bool scissor = glIsEnabled(0x0C11) != 0;
+	int n = snprintf(buf, sizeof(buf), "opengl (%s): %s | %s | %s | janela %p", glPath, glGetString(0x1F00),
+		glGetString(0x1F01), glGetString(0x1F02), w);
+	PIXELFORMATDESCRIPTOR pfd = {};
+	int pf = GetPixelFormat(dc);
+	if (pf && DescribePixelFormat(dc, pf, sizeof(pfd), &pfd))
+		n += snprintf(buf + n, sizeof(buf) - n, " | pixel format %d: flags %#lx (%s%s%s) cor %d alfa %d prof %d stencil %d",
+			pf, pfd.dwFlags, pfd.dwFlags & PFD_DOUBLEBUFFER ? "doublebuffer " : "",
+			pfd.dwFlags & PFD_GENERIC_FORMAT ? "GENERICO " : "", pfd.dwFlags & PFD_GENERIC_ACCELERATED ? "gen-acel " : "",
+			pfd.cColorBits, pfd.cAlphaBits, pfd.cDepthBits, pfd.cStencilBits);
+	else
+		n += snprintf(buf + n, sizeof(buf) - n, " | pixel format %d (erro %lu)", pf, GetLastError());
+	if (n > 0 && n < (int)sizeof(buf))
+		n += snprintf(buf + n, sizeof(buf) - n, " | bits r%d g%d b%d a%d prof%d sten%d | viewport %d,%d %dx%d | draw %#x read %#x"
+			" fbo %d | colormask %d%d%d%d | scissor %d fragprog %d blend %d depth %d alphatest %d tex2d %d"
+			" | cor %.2f,%.2f,%.2f,%.2f clear %.2f,%.2f,%.2f,%.2f | erro antes %#x, ao ler %#x",
+			bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], vp[0], vp[1], vp[2], vp[3], drawBuf, readBuf, fbo,
+			mask[0], mask[1], mask[2], mask[3], scissor, glIsEnabled(0x8804), glIsEnabled(0x0BE2), glIsEnabled(0x0B71),
+			glIsEnabled(0x0BC0), glIsEnabled(0x0DE1), color[0], color[1], color[2], color[3], clear[0], clear[1],
+			clear[2], clear[3], err0, glGetError());
+	LogFile_Write("trava", buf);
+
+	// pixel do meio da tela no buffer de tras (GL_BACK) ou da frente (GL_FRONT)
+	int cx = vp[0] + vp[2] / 2, cy = vp[1] + vp[3] / 2;
+	auto pixel = [&](unsigned which, unsigned char* px) {
+		glReadBuffer(which);
+		glReadPixels(cx, cy, 1, 1, 0x1908, 0x1401, px);  // GL_RGBA, GL_UNSIGNED_BYTE
+	};
+	HWND root = w ? GetAncestor(w, GA_ROOT) : NULL;
+	if (!red)
+	{
+		unsigned char front[4] = {}, back[4] = {};
+		pixel(0x0405, back);
+		pixel(0x0404, front);
+		glReadBuffer(readBuf);
+		snprintf(buf, sizeof(buf), "opengl como o jogo deixou: pixel do meio (%d,%d) atras %d,%d,%d,%d, na frente %d,%d,%d,%d, erro %#x",
+			cx, cy, back[0], back[1], back[2], back[3], front[0], front[1], front[2], front[3], glGetError());
+		LogFile_Write("trava", buf);
+		if (root)
+			WatchSaveWindow(root, "tela_normal.bmp");
+		WatchHooks();
+		return;
+	}
+
+	// quatro jeitos de por uma cor na janela, cada um com uma foto da tela: troca de buffers pelo opengl32 que o
+	// jogo usa, pelo gdi32, desenho direto no buffer da frente e pintura do Windows (GDI), sem OpenGL
+	GL_FN(void, glDrawBuffer, (unsigned));
+	GL_FN(void, glFlush, ());
+	HMODULE gdi = GetModuleHandleA("gdi32.dll");
+	BOOL(WINAPI* gdiSwap)(HDC) = gdi ? (BOOL(WINAPI*)(HDC))GetProcAddress(gdi, "SwapBuffers") : NULL;
+	static const char* const names[] = { "1_vermelho_wglSwapBuffers", "2_verde_SwapBuffers_gdi32",
+		"3_azul_desenho_na_frente", "4_amarelo_gdi" };
+	static const float cols[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+	glDisable(0x0C11);
+	glColorMask(1, 1, 1, 1);
+	for (int t = 0; t < 4; t++)
+	{
+		unsigned char front[4] = {}, back[4] = {};
+		BOOL ok = TRUE;
+		DWORD le = 0;
+		if (t < 3)
+		{
+			if (t == 2 && glDrawBuffer)
+				glDrawBuffer(0x0404);
+			glClearColor(cols[t][0], cols[t][1], cols[t][2], 1);
+			glClear(0x4000);  // GL_COLOR_BUFFER_BIT
+			glFinish();
+			pixel(0x0405, back);
+			SetLastError(0);
+			if (t == 0)
+				ok = wglSwapBuffers(dc);
+			else if (t == 1)
+				ok = gdiSwap && gdiSwap(dc);
+			else
+			{
+				if (glFlush)
+					glFlush();
+				if (glDrawBuffer)
+					glDrawBuffer(drawBuf);
+			}
+			le = GetLastError();
+			glFinish();
+		}
+		else if (w)
+		{
+			HDC wdc = GetDC(w);
+			RECT r;
+			GetClientRect(w, &r);
+			HBRUSH b = CreateSolidBrush(RGB(255, 255, 0));
+			ok = FillRect(wdc, &r, b);
+			DeleteObject(b);
+			GdiFlush();
+			ReleaseDC(w, wdc);
+		}
+		Sleep(500);
+		pixel(0x0404, front);
+		glReadBuffer(readBuf);
+		snprintf(buf, sizeof(buf), "teste %s: retorno %d (erro %lu), pixel do meio atras %d,%d,%d, na frente %d,%d,%d, erro gl %#x",
+			names[t], ok, le, back[0], back[1], back[2], front[0], front[1], front[2], glGetError());
+		LogFile_Write("trava", buf);
+		if (root)
+		{
+			char file[64];
+			snprintf(file, sizeof(file), "tela_%s.bmp", names[t]);
+			WatchSaveWindow(root, file);
+		}
+	}
+	glClearColor(clear[0], clear[1], clear[2], clear[3]);
+	glColorMask(mask[0], mask[1], mask[2], mask[3]);
+	if (scissor)
+		glEnable(0x0C11);
+}
+
+// Modulos carregados no jogo e o comeco das funcoes de troca de buffer: um jmp logo no comeco quer dizer que
+// algum programa (overlay da Steam/AMD/Discord, gravador de tela...) se pendurou nelas.
+static void WatchHooks()
+{
+	static WatchMod mods[400];
+	int n = WatchModules(mods, 400);
+	std::string line = "modulos:";
+	for (int i = 0; i < n; i++)
+	{
+		if (line.size() > 900)
+		{
+			LogFile_Write("trava", line.c_str());
+			line = "modulos (cont.):";
+		}
+		line += ' ';
+		line += mods[i].name;
+	}
+	LogFile_Write("trava", line.c_str());
+	for (int i = 0; i < n; i++)
+	{
+		const char* fn = !_stricmp(mods[i].name, "opengl32.dll") ? "wglSwapBuffers" :
+			!_stricmp(mods[i].name, "gdi32.dll") || !_stricmp(mods[i].name, "gdi32full.dll") ? "SwapBuffers" : NULL;
+		if (!fn)
+			continue;
+		HMODULE h = (HMODULE)(size_t)mods[i].base;
+		const BYTE* p = (const BYTE*)GetProcAddress(h, fn);
+		char path[MAX_PATH] = "", buf[700];
+		GetModuleFileNameA(h, path, sizeof(path));
+		if (!p)
+		{
+			snprintf(buf, sizeof(buf), "%s em %s: nao exporta", fn, path);
+			LogFile_Write("trava", buf);
+			continue;
+		}
+		int k = snprintf(buf, sizeof(buf), "%s em %s:", fn, path);
+		for (int j = 0; j < 8; j++)
+			k += snprintf(buf + k, sizeof(buf) - k, " %02x", p[j]);
+		DWORD to = 0;
+		if (p[0] == 0xE9)
+			to = (DWORD)(size_t)p + 5 + *(const LONG*)(p + 1);
+		else if (p[0] == 0xFF && p[1] == 0x25)
+			to = **(const DWORD* const*)(p + 2);
+		if (to)
+		{
+			k += snprintf(buf + k, sizeof(buf) - k, " -> pula para");
+			WatchName(buf + k, sizeof(buf) - k, mods, n, to);
+		}
+		LogFile_Write("trava", buf);
+	}
+}
+
+// foto da area da janela do jogo como aparece na tela (o que o Windows mostra), em Mod coop\<file>
+static void WatchSaveWindow(HWND w, const char* file)
+{
+	RECT r;
+	POINT p = {};
+	if (!GetClientRect(w, &r) || !ClientToScreen(w, &p) || r.right <= 0 || r.bottom <= 0)
+		return;
+	int cx = r.right, cy = r.bottom, stride = (cx * 3 + 3) & ~3;
+	HDC scr = GetDC(NULL);
+	HDC mem = CreateCompatibleDC(scr);
+	BITMAPINFO bi = {};
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = cx;
+	bi.bmiHeader.biHeight = cy;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 24;
+	bi.bmiHeader.biCompression = BI_RGB;
+	void* pix = NULL;
+	HBITMAP bm = CreateDIBSection(scr, &bi, DIB_RGB_COLORS, &pix, NULL, 0);
+	char buf[MAX_PATH + 200];
+	if (bm && pix)
+	{
+		HGDIOBJ old = SelectObject(mem, bm);
+		BitBlt(mem, 0, 0, cx, cy, scr, p.x, p.y, SRCCOPY | CAPTUREBLT);
+		GdiFlush();
+		double sum[3] = {};
+		for (int y = 0; y < cy; y++)
+			for (int x = 0; x < cx; x++)
+				for (int c = 0; c < 3; c++)
+					sum[c] += ((unsigned char*)pix)[y * stride + x * 3 + c];
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s", g_logPath);
+		if (char* slash = strrchr(path, '\\'))
+			snprintf(slash + 1, path + sizeof(path) - slash - 1, "%s", file);
+		BITMAPFILEHEADER fh = {};
+		fh.bfType = 0x4D42;
+		fh.bfOffBits = sizeof(fh) + sizeof(bi.bmiHeader);
+		fh.bfSize = fh.bfOffBits + stride * cy;
+		HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (f != INVALID_HANDLE_VALUE)
+		{
+			DWORD wr;
+			WriteFile(f, &fh, sizeof(fh), &wr, NULL);
+			WriteFile(f, &bi.bmiHeader, sizeof(bi.bmiHeader), &wr, NULL);
+			WriteFile(f, pix, stride * cy, &wr, NULL);
+			CloseHandle(f);
+		}
+		double px = (double)cx * cy;
+		HWND fg = GetForegroundWindow();
+		snprintf(buf, sizeof(buf), "foto da janela na tela (%dx%d em %ld,%ld, janela do jogo %sna frente): media RGB %.1f,%.1f,%.1f -> %s",
+			cx, cy, p.x, p.y, fg == w ? "" : "NAO esta ", sum[2] / px, sum[1] / px, sum[0] / px, path);
+		LogFile_Write("trava", buf);
+		SelectObject(mem, old);
+		DeleteObject(bm);
+	}
+	DeleteDC(mem);
+	ReleaseDC(NULL, scr);
+}
+
+// Contorno da tela preta em placas AMD (liga sozinho nelas; COFMP_FRENTE=1 forca, =0 desliga): no notebook com Radeon integrada o jogo desenha certo no
+// buffer de tras, mas a troca de buffers (wglSwapBuffers) nao chega na tela; desenhar direto no buffer da frente
+// aparece. Entao o wglSwapBuffers do opengl32.dll que o jogo carregou vira uma copia do buffer de tras para o da
+// frente (glBlitFramebuffer), sem trocar. O hw.dll chama essa funcao por ponteiro, entao o desvio e um jmp no
+// comeco dela; a original nao e mais chamada.
+typedef void(WINAPI* FrontBlit_t)(int, int, int, int, int, int, int, int, unsigned, unsigned);
+static FrontBlit_t g_frontBlit;
+static void(WINAPI* g_frontDrawBuffer)(unsigned);
+static void(WINAPI* g_frontReadBuffer)(unsigned);
+static void(WINAPI* g_frontGetIntegerv)(unsigned, int*);
+static unsigned char(WINAPI* g_frontIsEnabled)(unsigned);
+static void(WINAPI* g_frontDisable)(unsigned);
+static void(WINAPI* g_frontEnable)(unsigned);
+static void(WINAPI* g_frontFinish)();
+static LONG g_frontFrames;
+
+static BOOL WINAPI FrontSwapBuffers(HDC dc)
+{
+	RECT r;
+	HWND w = WindowFromDC(dc);
+	if (!w || !GetClientRect(w, &r) || r.right <= 0 || r.bottom <= 0)
+		return TRUE;
+	int draw = 0, read = 0;
+	g_frontGetIntegerv(0x0C01, &draw);  // GL_DRAW_BUFFER
+	g_frontGetIntegerv(0x0C02, &read);  // GL_READ_BUFFER
+	bool scissor = g_frontIsEnabled(0x0C11) != 0;
+	if (scissor)
+		g_frontDisable(0x0C11);
+	g_frontReadBuffer(0x0405);  // GL_BACK
+	g_frontDrawBuffer(0x0404);  // GL_FRONT
+	g_frontBlit(0, 0, r.right, r.bottom, 0, 0, r.right, r.bottom, 0x4000, 0x2600);  // GL_COLOR_BUFFER_BIT, GL_NEAREST
+	g_frontDrawBuffer(draw);
+	g_frontReadBuffer(read);
+	if (scissor)
+		g_frontEnable(0x0C11);
+	// glFinish segura o jogo no ritmo da placa, ja que sem a troca de buffers nada mais segura
+	g_frontFinish();
+	g_frontFrames++;
+	return TRUE;
+}
+
+static void FrontInstall()
+{
+	static bool tried;
+	if (tried)
+		return;
+	const char* env = getenv("COFMP_FRENTE");
+	if (env && *env == '0')
+	{
+		tried = true;
+		return;
+	}
+	HMODULE gl = GetModuleHandleA("opengl32.dll");
+	if (!gl)
+		return;
+	GL_FN(HGLRC, wglGetCurrentContext, ());
+	GL_FN(PROC, wglGetProcAddress, (LPCSTR));
+	GL_FN(const char*, glGetString, (unsigned));
+	if (!wglGetCurrentContext || !wglGetProcAddress || !glGetString || !wglGetCurrentContext())
+		return;  // tenta de novo no proximo frame
+	tried = true;
+	char path[MAX_PATH] = "", buf[MAX_PATH + 200];
+	// liga sozinho em placas AMD (o defeito foi visto na Radeon integrada do Ryzen 5500U); COFMP_FRENTE=1 forca em
+	// qualquer placa, COFMP_FRENTE=0 desliga
+	const char* vendor = glGetString(0x1F00);  // GL_VENDOR
+	bool amd = vendor && (strstr(vendor, "ATI") || strstr(vendor, "AMD"));
+	if (!amd && !(env && *env == '1'))
+		return;
+	GetModuleFileNameA(gl, path, sizeof(path));
+	g_frontBlit = (FrontBlit_t)wglGetProcAddress("glBlitFramebuffer");
+	if (!g_frontBlit)
+		g_frontBlit = (FrontBlit_t)wglGetProcAddress("glBlitFramebufferEXT");
+	g_frontDrawBuffer = (void(WINAPI*)(unsigned))GetProcAddress(gl, "glDrawBuffer");
+	g_frontReadBuffer = (void(WINAPI*)(unsigned))GetProcAddress(gl, "glReadBuffer");
+	g_frontGetIntegerv = (void(WINAPI*)(unsigned, int*))GetProcAddress(gl, "glGetIntegerv");
+	g_frontIsEnabled = (unsigned char(WINAPI*)(unsigned))GetProcAddress(gl, "glIsEnabled");
+	g_frontDisable = (void(WINAPI*)(unsigned))GetProcAddress(gl, "glDisable");
+	g_frontEnable = (void(WINAPI*)(unsigned))GetProcAddress(gl, "glEnable");
+	g_frontFinish = (void(WINAPI*)())GetProcAddress(gl, "glFinish");
+	BYTE* swap = (BYTE*)GetProcAddress(gl, "wglSwapBuffers");
+	DWORD old;
+	if (!g_frontBlit || !g_frontDrawBuffer || !g_frontReadBuffer || !g_frontGetIntegerv || !g_frontIsEnabled ||
+		!g_frontDisable || !g_frontEnable || !g_frontFinish || !swap || !VirtualProtect(swap, 5, PAGE_EXECUTE_READWRITE, &old))
+	{
+		snprintf(buf, sizeof(buf), "copia para a frente: nao deu para ligar (blit %p, wglSwapBuffers %p em %s)", g_frontBlit, swap, path);
+		LogFile_Write("trava", buf);
+		return;
+	}
+	swap[0] = 0xE9;
+	*(LONG*)(swap + 1) = (LONG)((BYTE*)FrontSwapBuffers - (swap + 5));
+	VirtualProtect(swap, 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), swap, 5);
+	snprintf(buf, sizeof(buf), "copia para a frente ligada (placa %s; wglSwapBuffers de %s desviado)", vendor, path);
+	LogFile_Write("trava", buf);
+}
+
+static void WatchBeat()
+{
+	InterlockedIncrement(&g_watchBeat);
+	FrontInstall();
+	LONG step = g_watchShot ? InterlockedExchange(&g_watchShot, 0) : 0;
+	if (!step--)
+		return;
+	char buf[600];
+	if (step == WATCH_STEPS)
+	{
+		// depois dos prints: teste do vermelho, e devolve os efeitos como estavam
+		WatchGL(true);
+		LogFile_Write("trava", "devolvendo os cvars como estavam");
+		g_eng->pfnServerCommand(g_watchRestore);
+		return;
+	}
+	if (step == 0)
+	{
+		WatchGL(false);
+		int r = 0;
+		for (const char* cv : g_watchCvars)
+			if (r >= 0 && r < (int)sizeof(g_watchRestore) - 1)
+				r += snprintf(g_watchRestore + r, sizeof(g_watchRestore) - r, "%s \"%s\";", cv, g_eng->pfnCVarGetString(cv));
+		if (r > 0 && r < (int)sizeof(g_watchRestore) - 1)
+			strcat(g_watchRestore, "\n");
+		else
+			g_watchRestore[0] = 0;
+	}
+	int n = snprintf(buf, sizeof(buf), "print %d (HalfLife%02d.tga), cvars:", step + 1, step);
+	for (const char* cv : g_watchCvars)
+		if (n > 0 && n < (int)sizeof(buf))
+			n += snprintf(buf + n, sizeof(buf) - n, " %s=%s", cv, g_eng->pfnCVarGetString(cv));
+	LogFile_Write("trava", buf);
+	g_eng->pfnServerCommand((char*)"screenshot\n");
+	if (step < WATCH_STEPS - 1)
+	{
+		snprintf(buf, sizeof(buf), "desligando para o proximo print: %s", g_watchSteps[step]);
+		LogFile_Write("trava", buf);
+		snprintf(buf, sizeof(buf), "%s\n", g_watchSteps[step]);
+		g_eng->pfnServerCommand(buf);
+	}
+}
+
+static int WatchModules(WatchMod* out, int max)
+{
+	HMODULE mods[512];
+	DWORD need;
+	if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need))
+		return 0;
+	int n = 0;
+	for (DWORD i = 0; i < need / sizeof(HMODULE) && i < 512 && n < max; i++)
+	{
+		MODULEINFO mi;
+		if (!K32GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi)))
+			continue;
+		out[n].base = (DWORD)(size_t)mi.lpBaseOfDll;
+		out[n].size = mi.SizeOfImage;
+		if (!K32GetModuleBaseNameA(GetCurrentProcess(), mods[i], out[n].name, sizeof(out[n].name)))
+			strcpy(out[n].name, "?");
+		n++;
+	}
+	return n;
+}
+
+static int WatchName(char* buf, int size, const WatchMod* m, int n, DWORD a)
+{
+	for (int i = 0; i < n; i++)
+		if (a - m[i].base < m[i].size)
+			return _snprintf(buf, size, " %s+%x", m[i].name, a - m[i].base);
+	return _snprintf(buf, size, " %x", a);
+}
+
+// a palavra da pilha parece endereco de retorno: aponta para codigo logo depois de uma instrucao call
+static bool WatchIsReturn(DWORD a)
+{
+	MEMORY_BASIC_INFORMATION mb;
+	if (a < 0x10000 || !VirtualQuery((void*)(size_t)(a - 7), &mb, sizeof(mb)) || mb.State != MEM_COMMIT ||
+		!(mb.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+		a > (DWORD)(size_t)mb.BaseAddress + mb.RegionSize)
+		return false;
+	const BYTE* p = (const BYTE*)(size_t)a;
+	return p[-5] == 0xE8 || (p[-6] == 0xFF && (p[-5] == 0x15 || (p[-5] & 0xF8) == 0x90)) ||
+		(p[-2] == 0xFF && ((p[-1] & 0xF8) == 0xD0 || (p[-1] & 0xF8) == 0x10)) || (p[-3] == 0xFF && (p[-2] & 0xF8) == 0x50);
+}
+
+static BOOL CALLBACK WatchWindow(HWND w, LPARAM lp)
+{
+	DWORD pid;
+	GetWindowThreadProcessId(w, &pid);
+	if (pid != GetCurrentProcessId())
+		return TRUE;
+	std::string* out = (std::string*)lp;
+	char cls[64], buf[160];
+	RECT r;
+	if (!GetClassNameA(w, cls, sizeof(cls)))
+		strcpy(cls, "?");
+	GetWindowRect(w, &r);
+	// so funcoes que nao mandam mensagem para a janela: funcionam mesmo com a thread dela travada
+	_snprintf(buf, sizeof(buf), " [%s%s%s%s %dx%d em %d,%d]", GetParent(w) ? "filha " : "", cls,
+		IsWindowVisible(w) ? "" : " invisivel", IsIconic(w) ? " minimizada" : "", r.right - r.left, r.bottom - r.top,
+		r.left, r.top);
+	buf[sizeof(buf) - 1] = 0;
+	if (out->size() < 700)
+		*out += buf;
+	if (!GetParent(w))
+		EnumChildWindows(w, WatchWindow, lp);
+	return TRUE;
+}
+
+static void WatchReport(int secs, LONG frames)
+{
+	std::string wins;
+	EnumWindows(WatchWindow, (LPARAM)&wins);
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	GetWindowThreadProcessId(fg, &pid);
+	char cls[64] = "nenhuma";
+	if (fg)
+		GetClassNameA(fg, cls, sizeof(cls));
+	char line[1000];
+	_snprintf(line, sizeof(line), "%d s de jogo: servidor rodou %ld frames, %ld copias para a frente; em primeiro plano: %s (%s); janelas:%s",
+		secs, frames, g_frontFrames, cls, pid == GetCurrentProcessId() ? "do jogo" : "de outro programa", wins.c_str());
+	line[sizeof(line) - 1] = 0;
+	LogFile_Write("trava", line);
+}
+
+static ULONGLONG WatchCpu()
+{
+	FILETIME c, e, k, u;
+	if (!GetThreadTimes(g_mainThread, &c, &e, &k, &u))
+		return 0;
+	return ((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime);
+}
+
+static void WatchSample(int secs, int cpu)
+{
+	static DWORD stack[16384]; // 64 KB a partir do ESP
+	CONTEXT c;
+	c.ContextFlags = CONTEXT_CONTROL;
+	DWORD n = 0;
+	if (SuspendThread(g_mainThread) == (DWORD)-1)
+		return;
+	BOOL ok = GetThreadContext(g_mainThread, &c);
+	MEMORY_BASIC_INFORMATION mb;
+	if (ok && VirtualQuery((void*)(size_t)c.Esp, &mb, sizeof(mb)) && mb.State == MEM_COMMIT)
+	{
+		n = ((DWORD)(size_t)mb.BaseAddress + (DWORD)mb.RegionSize - c.Esp) / 4;
+		if (n > 16384)
+			n = 16384;
+		memcpy(stack, (void*)(size_t)c.Esp, n * 4);
+	}
+	ResumeThread(g_mainThread);
+	if (!ok)
+		return;
+	static WatchMod mods[256];
+	int nm = WatchModules(mods, 256);
+	char line[1000];
+	int len = _snprintf(line, sizeof(line), "sem frame do servidor ha %d s (thread principal usando %d%% de cpu). eip:", secs,
+		cpu);
+	len += WatchName(line + len, sizeof(line) - len, mods, nm, c.Eip);
+	len += _snprintf(line + len, sizeof(line) - len, " pilha:");
+	DWORD prev = 0;
+	for (DWORD i = 0, found = 0; i < n && found < 28 && len < (int)sizeof(line) - 48; i++)
+		if (stack[i] != prev && WatchIsReturn(stack[i]))
+		{
+			len += WatchName(line + len, sizeof(line) - len, mods, nm, stack[i]);
+			prev = stack[i];
+			found++;
+		}
+	line[sizeof(line) - 1] = 0;
+	LogFile_Write("trava", line);
+}
+
+static DWORD WINAPI WatchThread(void*)
+{
+	LONG seen = g_watchBeat;
+	DWORD since = GetTickCount();
+	ULONGLONG cpu0 = WatchCpu();
+	int next = 8;
+	LogFile_Write("trava", "vigia de travamento ligado");
+	static const int reportAt[] = { 30, 90, 180 };
+	DWORD start = GetTickCount();
+	LONG reportBeat = g_watchBeat;
+	int report = 0;
+	const char* shotEnv = getenv("COFMP_PRINT");
+	int shots = shotEnv && *shotEnv == '1' ? 0 : WATCH_STEPS + 1;
+	for (;;)
+	{
+		Sleep(1000);
+		// primeiro print aos 20 s, depois um a cada 8 s; a ultima etapa (WATCH_STEPS) e o teste do vermelho
+		if (shots <= WATCH_STEPS && GetTickCount() - start >= 20000u + shots * 8000u)
+			InterlockedExchange(&g_watchShot, ++shots);
+		if (report < 3 && GetTickCount() - start >= (DWORD)reportAt[report] * 1000)
+		{
+			LONG now = g_watchBeat;
+			WatchReport(reportAt[report++], now - reportBeat);
+			reportBeat = now;
+		}
+		LONG b = g_watchBeat;
+		if (b != seen)
+		{
+			if (next > 8)
+				LogFile_Write("trava", "voltou a rodar");
+			seen = b;
+			since = GetTickCount();
+			cpu0 = WatchCpu();
+			next = 8;
+			continue;
+		}
+		DWORD ms = GetTickCount() - since;
+		if (next <= 128 && ms >= (DWORD)next * 1000)
+		{
+			// tempo de cpu em unidades de 100 ns; ms * 10000 = tempo de relogio na mesma unidade
+			int cpu = (int)((WatchCpu() - cpu0) * 100 / ((ULONGLONG)ms * 10000));
+			WatchSample(ms / 1000, cpu);
+			next *= 2;
+		}
+	}
+}
+
+static void WatchStart()
+{
+	if (g_mainThread || !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_mainThread,
+		THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
+		return;
+	if (HANDLE t = CreateThread(NULL, 0, WatchThread, NULL, 0, NULL))
+		CloseHandle(t);
+}
+
 static void HudCommand(const char* cmd)
 {
 	g_eng->pfnServerCommand((char*)cmd);
@@ -2865,8 +3665,10 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 			if (char* s = strrchr(dir, '\\'))
 				*s = 0;
 		strcat(dir, "\\" COFMP_DIR);
+		g_modDir = dir;
 		LogFile_Open(dir);
 		LogFile_Write("jogo", "---- cofmp v" COFMP_VERSION " carregado");
+		WatchStart();
 	}
 	Hud_Start(HudCommand);
 	if (!LoadHL())

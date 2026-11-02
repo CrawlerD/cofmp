@@ -89,6 +89,8 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 - frames do servidor com mais de 250 ms;
 - do túnel, a cada 10 s: pacotes, bytes e pedaços enviados e recebidos e o estado P2P (relay ou direto, e a fila da Steam).
 - itens (v1.11): no `inventorydrop N`, a arma do slot antes e depois do `hl.dll` (modelo, arquivo de inventário em +0x110, `iuser3`, `effects`, dono, posição), seguida por 10 s; quando um jogador encosta numa arma/item e algo muda, o item e os 7 slots antes e depois.
+- itens (v1.13): a arma do `inventorydrop` é achada pelo arquivo do slot; se o `hl.dll` a tirou do jogador e não a deixou visível no chão, o mod a põe no chão ("o mod pos"); itens no chão a até 120 unidades de um jogador são vigiados e, quando saem do chão, o log mostra o item e os slots do jogador antes e depois.
+- lanterna (v1.13): no comando `flashlight`, as flags, a visão (`m_iViewEntity`, +0x2038) e a bateria; fora de cutscene, uma visão presa em outra entidade (que esconde a lanterna da própria tela no `client.dll`) é devolvida ao jogador e logada.
 
 **Espera do grupo (v1.5):** ao carregar um mapa, o servidor congela os jogadores e segura os `trigger_*` (toque e `trigger_auto`) até nascerem `maxplayers` humanos. Depois de uma troca de mapa, espera quantos estavam no mapa anterior, por no máximo `cofmp_start_timeout` segundos (90 por padrão). Sem isso, o host nascia sozinho e a cutscene de abertura do `c_intro` rodava antes do amigo entrar. Desliga com `cofmp_start_wait 0`. Quem chega com uma `trigger_camera` ativa passa a ver a câmera também.
 

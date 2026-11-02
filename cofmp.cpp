@@ -226,8 +226,12 @@ enum
 	OFS_INV_MODEL = 0x2218,    // string_t inventorySlotModels[7]
 	OFS_INV_CLASS = 0x2234,    // string_t inventorySlotClassname[7]
 	OFS_FLASH_BATTERY = 0x22a8,
+	OFS_FLASH_FLAGS = 0x5d0,  // lanterna ligada (mandado ao cliente pela mensagem FlashFlags)
+	OFS_VIEW_ENTITY = 0x2038, // indice da entidade pela qual o jogador olha (mensagem ViewEntity)
 	OFS_GOOD_POINTS = 0x5f0,
-	OFS_ITEM_NEXT = 0x164, // CBasePlayerItem* m_pNext
+	OFS_ITEM_FILE = 0x110,   // string_t arquivo do inventario da arma
+	OFS_ITEM_PLAYER = 0x160, // CBasePlayer* m_pPlayer
+	OFS_ITEM_NEXT = 0x164,   // CBasePlayerItem* m_pNext
 	OFS_ITEM_ID = 0x168,
 	OFS_ITEM_CLIP = 0x1e4, // CBasePlayerWeapon::m_iClip
 };
@@ -1971,6 +1975,10 @@ static void SkipThink();
 static void RequestSkip(int i);
 static void TraceThink();
 static void InvWatchThink();
+static void FloorWatchThink();
+static void ViewFixThink();
+static void FlashLog(edict_t* e);
+static void ResetFloor();
 static void TraceDrop(edict_t* e);
 static void DropCommand(edict_t* e);
 
@@ -2035,6 +2043,8 @@ static void Hook_StartFrame()
 	SkipThink();
 	TraceThink();
 	InvWatchThink();
+	FloorWatchThink();
+	ViewFixThink();
 	BotThink();
 	HoldThink();
 	CutWaitThink();
@@ -2132,6 +2142,8 @@ static void Hook_ClientCommand(edict_t* e)
 	if (!drop)
 	{
 		g_orig.pfnClientCommand(e);
+		if (i > 0 && i < 33 && !strcmp(name, "flashlight"))
+			FlashLog(e);
 		return;
 	}
 	DropCommand(e);
@@ -2478,6 +2490,7 @@ static void TraceThink()
 
 static void ResetTrace()
 {
+	ResetFloor();
 	g_traced.clear();
 	g_tracing = false;
 	g_dropper = NULL;
@@ -2500,34 +2513,89 @@ static std::string Describe(edict_t* e)
 {
 	if (!e)
 		return "(nenhum)";
-	char buf[400];
+	char buf[600];
 	entvars_t* v = &e->v;
 	// +0x110 (arquivo do inventario) so existe nas armas; nos outros itens o campo e outra coisa
-	int file = e->pvPrivateData && !strncmp(STRING(v->classname), "weapon_", 7) ? Field<int>(e->pvPrivateData, 0x110) : 0;
+	bool weapon = e->pvPrivateData && !strncmp(STRING(v->classname), "weapon_", 7);
+	int file = weapon ? Field<int>(e->pvPrivateData, OFS_ITEM_FILE) : 0;
+	void* holder = weapon ? Field<void*>(e->pvPrivateData, OFS_ITEM_PLAYER) : NULL;
 	_snprintf(buf, sizeof(buf) - 1,
-		"#%d '%s' livre %d modelo '%s' (%d) arquivo '%s' effects %d solid %d movetype %d iuser3 %d target '%s' "
-		"spawnflags 0x%x flags 0x%x dono #%d aiment #%d em %.0f %.0f %.0f",
+		"#%d '%s' livre %d modelo '%s' (%d) arquivo '%s' effects %d solid %d movetype %d iuser3 %d iuser4 %d "
+		"target '%s' spawnflags 0x%x flags 0x%x armor %.0f dono #%d aiment #%d m_pPlayer #%d em %.0f %.0f %.0f",
 		g_eng->pfnIndexOfEdict(e), STRING(v->classname), e->free, v->model ? STRING(v->model) : "", v->modelindex,
-		file ? STRING(file) : "",
-		v->effects, v->solid, v->movetype, v->iuser3, v->target ? STRING(v->target) : "", v->spawnflags, v->flags,
+		file ? STRING(file) : "", v->effects, v->solid, v->movetype, v->iuser3, v->iuser4,
+		v->target ? STRING(v->target) : "", v->spawnflags, v->flags, v->armorvalue,
 		v->owner ? g_eng->pfnIndexOfEdict(v->owner) : 0, v->aiment ? g_eng->pfnIndexOfEdict(v->aiment) : 0,
-		v->origin.x, v->origin.y, v->origin.z);
+		holder && PevOf(holder) ? g_eng->pfnIndexOfEdict(PevOf(holder)->pContainingEntity) : 0, v->origin.x,
+		v->origin.y, v->origin.z);
 	buf[sizeof(buf) - 1] = 0;
 	return buf;
 }
 
-// inventorydrop N: a arma do slot N antes e depois, e o destino dela nos 10 s seguintes
+// A arma do slot (pelo arquivo do inventario; o nome de classe guardado no slot nao bate com o da arma).
+static void* SlotWeapon(void* pl, int slot)
+{
+	int file = Field<int>(pl, OFS_INV_SLOT + slot * 4);
+	if (!file || !*STRING(file))
+		return NULL;
+	const char* f = STRING(file);
+	std::string name = ItemName(f);
+	void* found = NULL;
+	ForEachItem(pl, [&](void* it) {
+		entvars_t* pev = PevOf(it);
+		if (found || !pev)
+			return;
+		int wf = Field<int>(it, OFS_ITEM_FILE);
+		if ((wf && !_stricmp(STRING(wf), f)) || !_stricmp(STRING(pev->classname), name.c_str()))
+			found = it;
+	});
+	return found;
+}
+
+static bool HasItem(void* pl, void* item)
+{
+	bool in = false;
+	ForEachItem(pl, [&](void* it) { in |= it == item; });
+	return in;
+}
+
+static bool OnFloor(edict_t* w)
+{
+	return !(w->v.effects & EF_NODRAW) && w->v.modelindex && w->v.solid != 0 && !w->v.aiment;
+}
+
+// O que o drop do proprio hl.dll faz no fim (CBasePlayer::DropPlayerItem): arma na posicao do jogador,
+// Spawn de novo (modelo do chao e FallInit, que faz cair e deixa pegar com o Usar) e DROP_TO_FLOOR.
+static void PutOnFloor(edict_t* w, edict_t* player)
+{
+	Field<void*>(w->pvPrivateData, OFS_ITEM_PLAYER) = NULL;
+	w->v.origin = player->v.origin;
+	w->v.movetype = 0;
+	w->v.solid = 1;
+	w->v.aiment = NULL;
+	w->v.owner = NULL;
+	w->v.effects &= ~EF_NODRAW;
+	g_orig.pfnSpawn(w);
+	g_eng->pfnDropToFloor(w);
+	w->v.armorvalue = 666.0f; // marca de item largado, como o jogo poe
+}
+
+// inventorydrop N: a arma do slot N antes e depois, e o destino dela nos 10 s seguintes. Se o hl.dll tirou
+// a arma do jogador mas nao a deixou no chao (some no MP), o mod poe no chao.
 static void DropCommand(edict_t* e)
 {
 	int i = g_eng->pfnIndexOfEdict(e), slot = atoi(g_eng->pfnCmd_Argv(1));
 	void* pl = e->pvPrivateData;
+	void* it = NULL;
 	edict_t* w = NULL;
+	std::string cls;
 	if (pl && slot >= 0 && slot < 7)
 	{
-		int cls = Field<int>(pl, OFS_INV_CLASS + slot * 4);
-		void* it = cls && *STRING(cls) ? FindItem(pl, STRING(cls)) : NULL;
+		it = SlotWeapon(pl, slot);
 		if (it && PevOf(it))
 			w = PevOf(it)->pContainingEntity;
+		if (w)
+			cls = STRING(w->v.classname);
 		Log("jogador %d larga o slot %d ('%s'): arma %s", i, slot,
 			Field<int>(pl, OFS_INV_SLOT + slot * 4) ? STRING(Field<int>(pl, OFS_INV_SLOT + slot * 4)) : "",
 			Describe(w).c_str());
@@ -2541,10 +2609,23 @@ static void DropCommand(edict_t* e)
 		return;
 	if (w->free || w->serialnumber != serial)
 	{
-		Log("  depois do drop: a arma foi liberada");
-		return;
+		Log("  depois do drop: a arma foi liberada; criando outra '%s' no chao", cls.c_str());
+		w = g_eng->pfnCreateNamedEntity(EngString(cls));
+		if (IsNull(w))
+			return;
+		w->v.origin = e->v.origin;
+		g_orig.pfnSpawn(w);
+		g_eng->pfnDropToFloor(w);
+		serial = w->serialnumber;
 	}
-	Log("  depois do drop: %s", Describe(w).c_str());
+	else if (!HasItem(pl, it) && !OnFloor(w))
+	{
+		Log("  depois do drop: %s", Describe(w).c_str());
+		PutOnFloor(w, e);
+		Log("  o jogo nao deixou a arma no chao; o mod pos: %s", Describe(w).c_str());
+	}
+	else
+		Log("  depois do drop: %s", Describe(w).c_str());
 	if (g_traced.size() < 16)
 	{
 		g_traced.push_back({ w, serial, g_eng->pfnIndexOfEdict(w), gpGlobals->time + 10.0f, STRING(w->v.classname) });
@@ -2575,6 +2656,108 @@ static bool PickupTouch(edict_t* item, edict_t* player)
 	if (g_tracing)
 		TraceCheck("o pegar item");
 	return true;
+}
+
+// Itens no chao perto de cada jogador: quando um sai do chao (pegou com o Usar, sumiu, foi apagado), uma linha
+// com quem estava perto e os slots dele antes e depois. O pegar do CoF e pelo Usar, que nao passa pelo Touch.
+struct FloorItem
+{
+	edict_t* e;
+	int serial;
+	std::string cls;
+	int who;
+	std::string slots;
+};
+static std::vector<FloorItem> g_floor;
+
+static bool IsLoot(edict_t* e)
+{
+	const char* c = STRING(e->v.classname);
+	return !strncmp(c, "weapon_", 7) || !strncmp(c, "item_", 5) || !strncmp(c, "ammo_", 5);
+}
+
+static void FloorWatchThink()
+{
+	static float next;
+	if (gpGlobals->time < next && gpGlobals->time > next - 1.0f)
+		return;
+	next = gpGlobals->time + 0.2f;
+	for (size_t k = 0; k < g_floor.size();)
+	{
+		FloorItem& f = g_floor[k];
+		edict_t* p = PlayerAt(f.who);
+		bool gone = f.e->free || f.e->serialnumber != f.serial;
+		if (gone || !OnFloor(f.e) || f.e->v.owner)
+		{
+			std::string after = p ? SlotsOf(p->pvPrivateData) : "?";
+			Log("item '%s' saiu do chao perto do jogador %d: %s; slots [%s] -> [%s]", f.cls.c_str(), f.who,
+				gone ? "liberado" : Describe(f.e).c_str(), f.slots.c_str(), after.c_str());
+			g_floor.erase(g_floor.begin() + k);
+			continue;
+		}
+		Vector d = p ? f.e->v.origin - p->v.origin : Vector(9999, 0, 0);
+		if (d.Length() > 200)
+		{
+			g_floor.erase(g_floor.begin() + k);
+			continue;
+		}
+		f.slots = SlotsOf(p->pvPrivateData);
+		k++;
+	}
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33 && g_floor.size() < 64; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || !IsAlive(p) || (p->v.flags & FL_FAKECLIENT))
+			continue;
+		for (edict_t* e = g_eng->pfnFindEntityInSphere(NULL, p->v.origin, 120); !IsNull(e) && g_floor.size() < 64;
+			 e = g_eng->pfnFindEntityInSphere(e, p->v.origin, 120))
+		{
+			if (!e->pvPrivateData || !IsLoot(e) || !OnFloor(e) || e->v.owner)
+				continue;
+			bool known = false;
+			for (const FloorItem& f : g_floor)
+				known |= f.e == e && f.serial == e->serialnumber;
+			if (!known)
+				g_floor.push_back({ e, e->serialnumber, STRING(e->v.classname), i, SlotsOf(p->pvPrivateData) });
+		}
+	}
+}
+
+static void ResetFloor()
+{
+	g_floor.clear();
+}
+
+// A lanterna da propria tela so e desenhada se o cliente acha que olha pelos proprios olhos: a mensagem
+// ViewEntity (m_iViewEntity do jogador) tem que ser 0 ou o indice dele. Fora de uma cutscene, se ficou com
+// outra entidade (outro jogador, uma camera que ja acabou), devolve para o proprio jogador.
+static void ViewFixThink()
+{
+	if (g_camOwner)
+		return;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT))
+			continue;
+		int& view = Field<int>(p->pvPrivateData, OFS_VIEW_ENTITY);
+		if (!view || view == i)
+			continue;
+		edict_t* v = g_eng->pfnPEntityOfEntIndex(view);
+		Log("jogador %d: visao presa na entidade #%d ('%s'), o que esconde a lanterna dele; devolvendo", i, view,
+			v && !v->free ? STRING(v->v.classname) : "");
+		view = i; // o hl.dll reenvia o ViewEntity no proximo UpdateClientData
+	}
+}
+
+static void FlashLog(edict_t* e)
+{
+	int i = g_eng->pfnIndexOfEdict(e);
+	if (!e->pvPrivateData)
+		return;
+	Log("jogador %d lanterna: flags %d, visao #%d, bateria %d, effects %d", i,
+		Field<int>(e->pvPrivateData, OFS_FLASH_FLAGS), Field<int>(e->pvPrivateData, OFS_VIEW_ENTITY),
+		Field<int>(e->pvPrivateData, OFS_FLASH_BATTERY), e->v.effects);
 }
 
 // Inventario de cada jogador (os 7 slots e as armas): uma linha no log a cada mudanca.

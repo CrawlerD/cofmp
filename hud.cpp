@@ -216,12 +216,15 @@ static std::string HostingFriend()
 		return "";
 	void** vt = *(void***)f;
 	typedef int(__thiscall * Count_t)(void*, int);
-	typedef CSteamID(__thiscall * ByIndex_t)(void*, int, int);
+	// metodo que devolve struct (CSteamID) recebe o endereco de retorno como 1o argumento depois do this;
+	// um ponteiro de funcao comum devolveria em edx:eax e a Steam escreveria no endereco "k"
+	typedef CSteamID*(__thiscall * ByIndex_t)(void*, CSteamID*, int, int);
 	typedef const char*(__thiscall * GetRP_t)(void*, CSteamID, const char*);
 	int n = ((Count_t)vt[VT_FRIEND_COUNT])(f, FRIEND_IMMEDIATE);
 	for (int k = 0; k < n; k++)
 	{
-		CSteamID id = ((ByIndex_t)vt[VT_FRIEND_BY_INDEX])(f, k, FRIEND_IMMEDIATE);
+		CSteamID id = {};
+		((ByIndex_t)vt[VT_FRIEND_BY_INDEX])(f, &id, k, FRIEND_IMMEDIATE);
 		std::string code = JoinArg(((GetRP_t)vt[VT_GET_FRIEND_RP])(f, id, "connect"));
 		if (!code.empty())
 			return code;

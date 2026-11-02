@@ -1334,16 +1334,62 @@ static const DWORD RVA_ChangeLevelNow = 0x109d40;
 static const BYTE SIG_ChangeLevelNow[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x53, 0x8B, 0xD9 };
 static const int STOLEN = 6; // push ebp / mov ebp,esp / sub esp,8
 
+// Entidades do CoF que agem so no ativador: o cof_teleport (leva so quem disparou a cena - no comeco do c_nightmare o
+// convidado ficava no quarto escuro), o cof_clearitems e o cof_giveitems (o mapa tira e da itens, como o celular e o
+// canivete no c_start). O Use de cada uma e trocado na vtable: roda normal e depois de novo para cada outro jogador
+// vivo, como se ele tambem tivesse disparado.
 typedef void(__thiscall* Use_t)(void* self, void* pActivator, void* pCaller, int useType, float value);
-static Use_t g_TeleportUseOrig;
-static const DWORD RVA_VT_COF_TELEPORT = 0x1c5b50; // vtable do cof_teleport
-static const DWORD RVA_TeleportUse = 0xa7990;
 static const int VT_USE = 58;
+enum { EACH_TELEPORT, EACH_CLEARITEMS, EACH_GIVEITEMS, EACH_COUNT };
+static struct
+{
+	const char* cls;
+	DWORD vt, use; // RVAs
+	Use_t orig;
+} g_each[EACH_COUNT] = {
+	{ "cof_teleport", 0x1c5b50, 0xa7990 },
+	{ "cof_clearitems", 0x1c3cd0, 0xa60c0 },
+	{ "cof_giveitems", 0x1c49b4, 0xa6bc0 },
+};
+
+static void UseForEach(int k, void* self, void* pActivator, void* pCaller, int useType, float value)
+{
+	g_each[k].orig(self, pActivator, pCaller, useType, value);
+	entvars_t* act = pActivator ? *(entvars_t**)((BYTE*)pActivator + 4) : NULL;
+	if (!act || !(act->flags & FL_CLIENT) || gpGlobals->maxClients <= 1 || !cv_enable.value)
+		return;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* o = PlayerAt(i);
+		if (!o || o == act->pContainingEntity || !IsAlive(o) || !o->pvPrivateData)
+			continue;
+		g_each[k].orig(self, o->pvPrivateData, pCaller, useType, value);
+		if (k == EACH_TELEPORT)
+			g_unstickAt[i] = gpGlobals->time + 0.2f; // caiu em cima de quem foi antes
+	}
+	edict_t* ent = (*(entvars_t**)((BYTE*)self + 4))->pContainingEntity;
+	Log("%s '%s' (%s) repetido para todos os jogadores", g_each[k].cls, STRING(ent->v.targetname),
+		STRING(ent->v.message));
+}
 
 static void __fastcall Hook_TeleportUse(void* self, void* /*edx*/, void* pActivator, void* pCaller, int useType, float value)
 {
 	g_scriptTeleportAt = gpGlobals->time;
-	g_TeleportUseOrig(self, pActivator, pCaller, useType, value);
+	UseForEach(EACH_TELEPORT, self, pActivator, pCaller, useType, value);
+}
+
+static void __fastcall Hook_ClearItemsUse(void* self, void*, void* pActivator, void* pCaller, int useType, float value)
+{
+	UseForEach(EACH_CLEARITEMS, self, pActivator, pCaller, useType, value);
+}
+
+static void __fastcall Hook_GiveItemsUse(void* self, void*, void* pActivator, void* pCaller, int useType, float value)
+{
+	entvars_t* pev = *(entvars_t**)((BYTE*)self + 4);
+	if ((pev->spawnflags & 1) && cv_share_items.value) // item de inventario (chave etc.): o ShareThink ja divide
+		g_each[EACH_GIVEITEMS].orig(self, pActivator, pCaller, useType, value);
+	else
+		UseForEach(EACH_GIVEITEMS, self, pActivator, pCaller, useType, value);
 }
 
 static void InstallDetour()
@@ -1391,16 +1437,20 @@ static void InstallDetour()
 	else
 		Log("aviso: assinatura de SendInvSlot nao confere - inventario pode sumir da tela ao renascer");
 
-	void** vt = (void**)((BYTE*)g_hl + RVA_VT_COF_TELEPORT);
-	DWORD vold;
-	if (vt[VT_USE] == (BYTE*)g_hl + RVA_TeleportUse && VirtualProtect(&vt[VT_USE], 4, PAGE_READWRITE, &vold))
+	void* hooks[EACH_COUNT] = { (void*)&Hook_TeleportUse, (void*)&Hook_ClearItemsUse, (void*)&Hook_GiveItemsUse };
+	for (int k = 0; k < EACH_COUNT; k++)
 	{
-		g_TeleportUseOrig = (Use_t)vt[VT_USE];
-		vt[VT_USE] = (void*)&Hook_TeleportUse;
-		VirtualProtect(&vt[VT_USE], 4, vold, &vold);
+		void** vt = (void**)((BYTE*)g_hl + g_each[k].vt);
+		DWORD vold;
+		if (vt[VT_USE] == (BYTE*)g_hl + g_each[k].use && VirtualProtect(&vt[VT_USE], 4, PAGE_READWRITE, &vold))
+		{
+			g_each[k].orig = (Use_t)vt[VT_USE];
+			vt[VT_USE] = hooks[k];
+			VirtualProtect(&vt[VT_USE], 4, vold, &vold);
+		}
+		else
+			Log("aviso: vtable do %s nao confere - ele vai agir so em quem disparou", g_each[k].cls);
 	}
-	else
-		Log("aviso: vtable do cof_teleport nao confere - saida do fim do c_intro vai esperar o grupo");
 
 	BYTE* fn = (BYTE*)g_hl + RVA_ChangeLevelNow;
 	if (memcmp(fn, SIG_ChangeLevelNow, sizeof(SIG_ChangeLevelNow)))
@@ -1854,7 +1904,7 @@ static bool IsTriggerEnt(edict_t* e)
 // Motivos para um jogador nao tomar dano (esperando o grupo para uma cutscene, camera ligada). Enquanto houver
 // algum, takedamage fica DAMAGE_NO, FL_GODMODE ligado e a vida nao cai; quando o ultimo sai, volta como estava.
 
-enum { GOD_WAIT = 1, GOD_CAM = 2 };
+enum { GOD_WAIT = 1, GOD_CAM = 2, GOD_ADMIN = 4, GOD_SPEC = 8 }; // ADMIN: god mode do Home; SPEC: espectando
 static struct
 {
 	int why;
@@ -1880,11 +1930,13 @@ static void SetGod(int i, int why, bool on)
 		g_god[i].health = p->v.health;
 		p->v.takedamage = DAMAGE_NO;
 		p->v.flags |= FL_GODMODE;
-		Note("jogador %d imortal (%s)", i, why == GOD_WAIT ? "esperando o grupo" : "cutscene");
+		Note("jogador %d imortal (%s)", i,
+			why == GOD_WAIT ? "esperando o grupo" : why == GOD_CAM ? "cutscene" : why == GOD_ADMIN ? "god mode" : "espectando");
 	}
 	else if (before && !g_god[i].why)
 	{
-		p->v.takedamage = g_god[i].takedamage;
+		// ligado antes da troca de mapa: o valor guardado ja era o nosso DAMAGE_NO
+		p->v.takedamage = g_god[i].takedamage != DAMAGE_NO ? g_god[i].takedamage : DAMAGE_AIM;
 		p->v.flags &= ~FL_GODMODE;
 		Note("jogador %d mortal de novo", i);
 	}
@@ -1916,6 +1968,329 @@ static void GodThink()
 static void ResetGod()
 {
 	memset(g_god, 0, sizeof(g_god));
+}
+
+// ---------------------------------------------------------------- comandos do Home (noclip, god, TP, espectar)
+//
+// A janela do Home de cada jogador manda "cmd cofmp_admin <noclip|god> <0|1>", "cmd cofmp_admin tp <n>" e
+// "cmd cofmp_admin spec <n>" (0 = parar). Noclip e god continuam ligados na troca de mapa (o engine
+// desconecta e reconecta todos nela, entao so zeram quando um servidor novo abre).
+// Espectar usa o modo "primeira pessoa" do espectador do HL, que o client.dll do CoF ainda tem: iuser1 = 4 e
+// iuser2 = quem e seguido; o corpo de quem espia some, nao colide, nao toma dano e os monstros o ignoram.
+
+static const int OBS_IN_EYE = 4;
+static bool g_adminGod[33], g_noclip[33];
+static struct
+{
+	int target; // 0 = nao esta espectando
+	Vector origin, angles;
+	int movetype, solid;
+} g_spec[33];
+static bool g_specFix[33]; // espectava quando o mapa trocou: o corpo veio na transicao ainda invisivel
+
+static edict_t* ClientAt(int i) // como PlayerAt, mas vale tambem para quem esta espectando
+{
+	edict_t* e = g_eng->pfnPEntityOfEntIndex(i);
+	return !IsNull(e) && (e->v.flags & FL_CLIENT) && e->pvPrivateData ? e : NULL;
+}
+
+static void ShowBody(int i, edict_t* p)
+{
+	p->v.iuser1 = p->v.iuser2 = 0;
+	p->v.effects &= ~EF_NODRAW;
+	p->v.flags &= ~FL_NOTARGET;
+	if (p->v.solid == SOLID_NOT)
+		p->v.solid = SOLID_SLIDEBOX;
+	p->v.movetype = g_noclip[i] ? MOVETYPE_NOCLIP : MOVETYPE_WALK;
+	SetGod(i, GOD_SPEC, false);
+	if (!g_god[i].why) // depois da troca de mapa o g_god ja foi zerado e o DAMAGE_NO veio no corpo
+	{
+		p->v.takedamage = DAMAGE_AIM;
+		p->v.flags &= ~FL_GODMODE;
+	}
+}
+
+static void StopSpec(int i, const char* why)
+{
+	if (i < 1 || i >= 33 || !g_spec[i].target)
+		return;
+	g_spec[i].target = 0;
+	edict_t* p = ClientAt(i);
+	if (!p)
+		return;
+	ShowBody(i, p);
+	p->v.solid = g_spec[i].solid ? g_spec[i].solid : SOLID_SLIDEBOX;
+	Vector pos = g_spec[i].origin;
+	FindFreeSpot(pos, p);
+	g_eng->pfnSetOrigin(p, pos);
+	p->v.velocity = Vector(0, 0, 0);
+	p->v.angles = p->v.v_angle = g_spec[i].angles;
+	p->v.fixangle = 1;
+	g_unstickAt[i] = gpGlobals->time + 0.2f;
+	Log("jogador %d parou de espectar (%s)", i, why);
+}
+
+static void StartSpec(int i, edict_t* p, int t)
+{
+	edict_t* o = PlayerAt(t);
+	if (t == i || !o || !IsAlive(o))
+	{
+		g_eng->pfnClientPrintf(p, print_center, "Esse jogador nao esta vivo no mapa");
+		return;
+	}
+	if (g_spec[i].target)
+	{
+		g_spec[i].target = t; // so troca quem e seguido
+		p->v.iuser2 = t;
+		Log("jogador %d agora espectando o jogador %d", i, t);
+		return;
+	}
+	if (!IsAlive(p))
+	{
+		g_eng->pfnClientPrintf(p, print_center, "Morto nao pode espectar");
+		return;
+	}
+	SetGod(i, GOD_SPEC, true);
+	g_spec[i].target = t;
+	g_spec[i].origin = p->v.origin;
+	g_spec[i].angles = p->v.v_angle;
+	g_spec[i].solid = p->v.solid;
+	p->v.iuser1 = OBS_IN_EYE;
+	p->v.iuser2 = t;
+	p->v.effects |= EF_NODRAW;
+	p->v.solid = SOLID_NOT;
+	p->v.movetype = MOVETYPE_NOCLIP;
+	p->v.flags |= FL_NOTARGET;
+	p->v.takedamage = DAMAGE_NO;
+	Log("jogador %d espectando o jogador %d", i, t);
+}
+
+static void TeleportTo(int i, edict_t* p, int t)
+{
+	if (g_spec[i].target)
+		StopSpec(i, "teleporte");
+	edict_t* o = PlayerAt(t);
+	if (t == i || !o || !IsAlive(o) || !IsAlive(p))
+	{
+		g_eng->pfnClientPrintf(p, print_center, "Esse jogador nao esta vivo no mapa");
+		return;
+	}
+	Vector pos = o->v.origin;
+	if (!FindFreeSpot(pos, p))
+	{
+		g_eng->pfnClientPrintf(p, print_center, "Sem espaco livre perto dele");
+		return;
+	}
+	g_eng->pfnSetOrigin(p, pos);
+	p->v.velocity = Vector(0, 0, 0);
+	p->v.angles = p->v.v_angle = o->v.v_angle;
+	p->v.fixangle = 1;
+	Log("jogador %d teleportado ate o jogador %d (%.0f %.0f %.0f)", i, t, pos.x, pos.y, pos.z);
+}
+
+static void AdminCommand(int i, edict_t* p)
+{
+	const char* what = g_eng->pfnCmd_Argv(1);
+	int n = atoi(g_eng->pfnCmd_Argv(2));
+	if (!_stricmp(what, "noclip"))
+	{
+		g_noclip[i] = n != 0;
+		if (!g_spec[i].target)
+			p->v.movetype = g_noclip[i] ? MOVETYPE_NOCLIP : MOVETYPE_WALK;
+		if (!g_noclip[i])
+			g_unstickAt[i] = gpGlobals->time + 0.2f; // desligou dentro da parede
+		g_eng->pfnClientPrintf(p, print_center, g_noclip[i] ? "Noclip ligado" : "Noclip desligado");
+		Log("jogador %d: noclip %s", i, g_noclip[i] ? "ligado" : "desligado");
+	}
+	else if (!_stricmp(what, "god"))
+	{
+		g_adminGod[i] = n != 0;
+		SetGod(i, GOD_ADMIN, g_adminGod[i]);
+		g_eng->pfnClientPrintf(p, print_center, g_adminGod[i] ? "God mode ligado" : "God mode desligado");
+		Log("jogador %d: god mode %s", i, g_adminGod[i] ? "ligado" : "desligado");
+	}
+	else if (!_stricmp(what, "tp"))
+		TeleportTo(i, p, n);
+	else if (!_stricmp(what, "spec"))
+	{
+		if (n)
+			StartSpec(i, p, n);
+		else
+			StopSpec(i, "pedido");
+	}
+}
+
+static void AdminThink()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = ClientAt(i);
+		if (!p)
+			continue;
+		if (g_specFix[i])
+		{
+			g_specFix[i] = false;
+			ShowBody(i, p);
+			g_unstickAt[i] = gpGlobals->time + 0.2f;
+			Log("jogador %d chegou no mapa novo sem espectar", i);
+		}
+		if (g_spec[i].target)
+		{
+			edict_t* o = PlayerAt(g_spec[i].target);
+			if (!o || !IsAlive(o))
+			{
+				StopSpec(i, "o jogador seguido saiu ou morreu");
+				continue;
+			}
+			// o corpo vai junto: o servidor manda o que esta perto dele, e a volta e para o lugar de antes
+			g_eng->pfnSetOrigin(p, o->v.origin);
+			p->v.velocity = o->v.velocity;
+			p->v.iuser1 = OBS_IN_EYE;
+			p->v.iuser2 = g_spec[i].target;
+			p->v.takedamage = DAMAGE_NO;
+			continue;
+		}
+		if (!IsPlayer(p) || !IsAlive(p))
+			continue;
+		if (g_noclip[i] && p->v.movetype != MOVETYPE_NOCLIP)
+			p->v.movetype = MOVETYPE_NOCLIP;
+		if (g_adminGod[i] && !(g_god[i].why & GOD_ADMIN))
+			SetGod(i, GOD_ADMIN, true);
+	}
+}
+
+// ServerActivate: o mapa e novo; quem espectava chega pela transicao com o corpo escondido
+static void ResetAdmin(bool newServer)
+{
+	for (int i = 0; i < 33; i++)
+	{
+		g_specFix[i] = g_spec[i].target != 0;
+		g_spec[i].target = 0;
+	}
+	if (newServer)
+	{
+		memset(g_adminGod, 0, sizeof(g_adminGod));
+		memset(g_noclip, 0, sizeof(g_noclip));
+	}
+}
+
+// ---------------------------------------------------------------- pausa so com todos no menu
+//
+// O GameUI.dll do CoF manda "setpause" ao abrir o menu (Esc) e "unpause" ao fechar, sem olhar se o jogo e
+// multiplayer: o Esc de qualquer um congelava todos. O cofmp.dll no jogo de cada um troca isso por
+// "cmd cofmp_menu 1/0" (hud.cpp); aqui o servidor so pausa quando todos os jogadores estao com o menu aberto.
+// O "setpause" vai pelo console do host, que o repassa ao servidor como se ele tivesse digitado.
+
+static bool g_inMenu[33], g_menuPaused;
+
+static void MenuCheck()
+{
+	int humans = 0, inMenu = 0;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = ClientAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT))
+			continue;
+		humans++;
+		inMenu += g_inMenu[i];
+	}
+	bool all = humans > 0 && inMenu == humans;
+	if (all && !g_menuPaused)
+	{
+		g_menuPaused = true;
+		g_eng->pfnServerCommand((char*)"setpause\n");
+		Log("todos com o menu aberto (%d): jogo pausado", humans);
+	}
+	else if (!all && g_menuPaused)
+	{
+		g_menuPaused = false;
+		g_eng->pfnServerCommand((char*)"unpause\n");
+		Log("menu fechado por alguem (%d de %d ainda no menu): jogo despausado", inMenu, humans);
+	}
+}
+
+static void MenuCommand(int i)
+{
+	bool open = atoi(g_eng->pfnCmd_Argv(1)) != 0;
+	if (g_inMenu[i] == open)
+		return;
+	g_inMenu[i] = open;
+	Note("jogador %d %s o menu", i, open ? "abriu" : "fechou");
+	MenuCheck();
+}
+
+static void ResetMenu()
+{
+	memset(g_inMenu, 0, sizeof(g_inMenu));
+	g_menuPaused = false; // servidor novo nasce despausado
+}
+
+// ---------------------------------------------------------------- save co-op
+//
+// O engine do CoF so salva pelo "savehack" (as maquinas de save: liga uma flag e chama o save) e recusa
+// multiplayer ("Can't save multiplayer games."). O save em si (SV_SaveGameState) e o mesmo da troca de mapa,
+// que ja funciona com varios jogadores; entao, no host, pulamos so o teste do maxplayers e ligamos a flag nos
+// nossos saves. Os saves co-op ficam em SAVE\coop_<mapa>_<data>.sav, longe dos cofsave1..5 do single player.
+// Qualquer jogador pode pedir (Home > Salvar, ou uma maquina de save: o hud.cpp troca o "savehack cofsaveN"
+// por "cmd cofmp_save maquina"); o save e sempre do host. Carregar e pelo Home do host (load + tunel).
+
+static const DWORD RVA_SAVE_MP_JE = 0x8233b;     // je depois de cmp [svs.maxclients], 1 no SaveGameCheck
+static const DWORD RVA_SAVE_MP_MSG = 0x1be260;   // "Can't save multiplayer games.\n"
+static const DWORD RVA_SAVEHACK_FLAG = 0x21b69;  // mov dword [flag], 1 no tratamento do "savehack"
+static volatile int* g_saveFlag;
+
+static void InstallSavePatch()
+{
+	BYTE* hw = (BYTE*)GetModuleHandleA("hw.dll");
+	if (!hw)
+		return;
+	BYTE* je = hw + RVA_SAVE_MP_JE;
+	BYTE* flag = hw + RVA_SAVEHACK_FLAG;
+	if (je[-7] != 0x83 || je[-6] != 0x3d || je[-1] != 1 || (je[0] != 0x74 && je[0] != 0xeb) || je[2] != 0x68 ||
+		*(DWORD*)(je + 3) != (DWORD)(hw + RVA_SAVE_MP_MSG) || memcmp(hw + RVA_SAVE_MP_MSG, "Can't save multiplayer", 22) ||
+		flag[0] != 0xc7 || flag[1] != 0x05 || *(DWORD*)(flag + 6) != 1)
+	{
+		Log("aviso: o hw.dll e de outra versao - o save co-op fica desligado");
+		return;
+	}
+	DWORD old;
+	if (je[0] == 0x74 && VirtualProtect(je, 1, PAGE_EXECUTE_READWRITE, &old))
+	{
+		je[0] = 0xeb;
+		VirtualProtect(je, 1, old, &old);
+		FlushInstructionCache(GetCurrentProcess(), je, 1);
+	}
+	g_saveFlag = *(int**)(flag + 2);
+}
+
+static void CoopSave(const char* why, edict_t* asker)
+{
+	if (!g_saveFlag)
+	{
+		Log("save (%s) recusado: save co-op desligado (hw.dll de outra versao)", why);
+		return;
+	}
+	edict_t* host = PlayerAt(1);
+	if (!host || !IsAlive(host))
+	{
+		// o engine olha a vida do primeiro jogador (o host): "Can't savegame with a dead player"
+		if (asker)
+			g_eng->pfnClientPrintf(asker, print_center, "Nao da para salvar com o host morto");
+		Log("save (%s) recusado: host morto", why);
+		return;
+	}
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	char name[96], cmd[128];
+	_snprintf(name, sizeof(name), "coop_%s_%02d%02d-%02d%02d%02d", STRING(gpGlobals->mapname), t.wDay, t.wMonth, t.wHour,
+		t.wMinute, t.wSecond);
+	name[sizeof(name) - 1] = 0;
+	_snprintf(cmd, sizeof(cmd), "save %s\n", name);
+	cmd[sizeof(cmd) - 1] = 0;
+	*g_saveFlag = 1; // o "save" do console roda no proximo frame e zera a flag
+	g_eng->pfnServerCommand(cmd);
+	CenterPrintAll("Partida salva");
+	Log("salvando a partida em SAVE\\%s.sav (%s)", name, why);
 }
 
 // ---------------------------------------------------------------- espera antes das cutscenes
@@ -2293,6 +2668,9 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	bool arrived = g_transit.pending && !_stricmp(map, g_transit.map.c_str());
 	// mesmo mapa de novo sem changelevel nosso = todos morreram: volta ao checkpoint
 	bool restart = !arrived && !_stricmp(map, g_lastMap.c_str());
+	bool fromMenu = g_lastMap.empty() || !_strnicmp(g_lastMap.c_str(), "c_game_menu", 11);
+	ResetAdmin(fromMenu);
+	ResetMenu();
 	g_lastMap = map;
 	ResetRespawn();
 	for (int i = 1; i < 33; i++)
@@ -2316,9 +2694,11 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	}
 	g_transit.pending = false;
 
-	// servidor recem-aberto (ninguem veio do mapa anterior) espera a lotacao; troca de mapa espera o grupo
+	// servidor recem-aberto (veio do menu) espera a lotacao; troca de mapa espera quem estava no mapa anterior. O
+	// g_humansLast e a contagem do ultimo frame do mapa anterior: na troca de mapa o engine desconecta todo mundo
+	// antes deste ServerActivate, e descontar essas saidas fazia o mapa seguinte esperar so 1 jogador.
 	if (_strnicmp(map, "c_game_menu", 11))
-		StartHold(g_humansLast <= 0 && !arrived && !restart);
+		StartHold(fromMenu && !arrived && !restart);
 	else
 		ClearHold();
 
@@ -2505,6 +2885,7 @@ static void Hook_StartFrame()
 	HoldThink();
 	CutWaitThink();
 	GodThink();
+	AdminThink();
 	CamJoinThink();
 	GatherThink();
 	ArriveThink();
@@ -2588,6 +2969,22 @@ static void Hook_ClientCommand(edict_t* e)
 		RequestSkip(i);
 		return;
 	}
+	if (i > 0 && i < 33 && !strcmp(name, "cofmp_menu")) // Esc: menu do jogo aberto/fechado (hud.cpp)
+	{
+		MenuCommand(i);
+		return;
+	}
+	if (i > 0 && i < 33 && !strcmp(name, "cofmp_admin")) // painel de comandos do Home
+	{
+		Log("jogador %d: cofmp_admin %s", i, g_eng->pfnCmd_Args());
+		AdminCommand(i, e);
+		return;
+	}
+	if (i > 0 && i < 33 && !strcmp(name, "cofmp_save")) // Home > Salvar, ou uma maquina de save
+	{
+		CoopSave(g_eng->pfnCmd_Argv(1), e);
+		return;
+	}
 	bool drop = i > 0 && i < 33 && !strcmp(name, "inventorydrop");
 	if (i > 0 && i < 33)
 	{
@@ -2659,8 +3056,15 @@ static void Hook_ClientDisconnect(edict_t* e)
 		g_cut.waiting[i] = false;
 		g_cut.frozen[i] = false;
 		g_god[i] = {};
-		if (!g_hold.active && !(e->v.flags & FL_FAKECLIENT) && g_humansLast > 0)
-			g_humansLast--;
+		// a troca de mapa tambem passa aqui (com o corpo ja no mapa novo): nada de voltar ao ponto antigo,
+		// o corpo so reaparece onde esta (AdminThink)
+		for (int k = 1; k < 33; k++)
+			if (k == i || g_spec[k].target == i)
+			{
+				g_specFix[k] = g_specFix[k] || g_spec[k].target != 0;
+				g_spec[k].target = 0;
+			}
+		g_inMenu[i] = false;
 		Log("jogador %d desconectou (foto do inventario %s)", i, g_inv[i].valid ? "mantida" : "vazia");
 	}
 	g_orig.pfnClientDisconnect(e);
@@ -4153,6 +4557,12 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 		WatchStart();
 	}
 	Hud_Start(HudCommand);
+	static bool savePatched;
+	if (!savePatched)
+	{
+		savePatched = true;
+		InstallSavePatch();
+	}
 	if (!LoadHL())
 		return;
 	g_engForHL = *eng;

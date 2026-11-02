@@ -226,8 +226,10 @@ static void DoHost()
 	SetDlgItemTextA(g_hud, ID_CODE, "");
 	DeleteFileA((g_tunnelDir + "\\codigo.txt").c_str());
 	bool tunnel = StartTunnel("host");
-	char cmd[160];
-	sprintf(cmd, "disconnect\nsv_lan 0\nmaxplayers %d\nmap %s\n", players, map.c_str());
+	// sv_lan 1: servidor sem VAC (o amigo chega pelo tunel como 127.0.0.1, que conta como LAN);
+	// sv_lan_rate: o padrao (20000) limita a banda de quem vem pela LAN
+	char cmd[200];
+	sprintf(cmd, "disconnect\nsv_lan 1\nsv_lan_rate 100000\nmaxplayers %d\nmap %s\n", players, map.c_str());
 	Queue(cmd);
 	if (!tunnel)
 	{
@@ -311,8 +313,9 @@ static void Connect()
 		Status(L"O túnel do host não respondeu. Tentando entrar mesmo assim; veja a janela do túnel.");
 	}
 	KillTimer(g_hud, TIMER_CONNECT);
-	char cmd[64];
-	sprintf(cmd, "connect 127.0.0.1:%d\n", TUNNEL_PORT);
+	// o padrao do jogo (cl_cmdrate 30, rate 25000) atrasa os comandos e corta pacotes
+	char cmd[128];
+	sprintf(cmd, "rate 100000\ncl_cmdrate 60\ncl_updaterate 30\nconnect 127.0.0.1:%d\n", TUNNEL_PORT);
 	Queue(cmd);
 	Status(L"Entrando... Se não conectar, aperte Entrar de novo.");
 	ShowHud(false);

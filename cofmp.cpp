@@ -17,6 +17,14 @@
 #include <vector>
 #include "exports_fwd.h" // gerado por gen_def.py
 #include "hud.h"
+#include "logfile.h"
+
+#ifndef FL_GODMODE
+#define FL_GODMODE (1 << 6)
+#endif
+#ifndef DAMAGE_NO
+#define DAMAGE_NO 0
+#endif
 
 // Layout de entvars_t do Cry of Fear (sdk_cof/progdefs.h); offsets lidos de gEntvarsDescription no hl.dll.
 static_assert(offsetof(entvars_t, health) == 0x164, "entvars_t");
@@ -42,6 +50,7 @@ static cvar_t cv_respawn_time = { (char*)"cofmp_respawn_time", (char*)"30", FCVA
 static cvar_t cv_model = { (char*)"cofmp_model", (char*)"simon", FCVAR_SERVER };
 static cvar_t cv_start_wait = { (char*)"cofmp_start_wait", (char*)"1", FCVAR_SERVER };
 static cvar_t cv_start_timeout = { (char*)"cofmp_start_timeout", (char*)"90", FCVAR_SERVER };
+static cvar_t cv_cutscene_wait = { (char*)"cofmp_cutscene_wait", (char*)"1", FCVAR_SERVER };
 
 // ---------------------------------------------------------------- util
 
@@ -61,6 +70,19 @@ static void Log(const char* fmt, ...)
 	g_eng->pfnServerPrint("[cofmp] ");
 	g_eng->pfnServerPrint(buf);
 	g_eng->pfnServerPrint("\n");
+	LogFile_Write("jogo", buf);
+}
+
+// so no cofmp_log.txt (coisas frequentes demais para o console)
+static void Note(const char* fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	_vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+	va_end(ap);
+	buf[sizeof(buf) - 1] = 0;
+	LogFile_Write("jogo", buf);
 }
 
 static bool IsNull(edict_t* e)
@@ -303,10 +325,22 @@ static bool Has(const std::vector<std::string>& v, const std::string& x)
 	return std::find(v.begin(), v.end(), x) != v.end();
 }
 
+// pfnAllocString nunca devolve memoria ate a troca de mapa: guarda as strings ja alocadas
+static std::unordered_map<std::string, int> g_strings;
+
+static int EngString(const std::string& s)
+{
+	auto it = g_strings.find(s);
+	if (it != g_strings.end())
+		return it->second;
+	int v = g_eng->pfnAllocString(s.c_str());
+	g_strings[s] = v;
+	return v;
+}
+
 static bool GiveInvItem(void* pl, const std::string& file)
 {
-	return g_AddToInventory(pl, g_eng->pfnAllocString(file.c_str()), g_eng->pfnAllocString(""),
-			   g_eng->pfnAllocString("item_key")) != 0;
+	return g_AddToInventory(pl, EngString(file), EngString(""), EngString("item_key")) != 0;
 }
 
 struct SavedWeapon
@@ -488,6 +522,7 @@ static std::vector<std::string> g_keyring;
 static std::vector<std::string> g_seen[33]; // itens de cada jogador na ultima varredura
 static bool g_seenValid[33];
 static float g_nextShare;
+static float g_giveRetryAt[33];
 
 static std::string ItemName(const std::string& file)
 {
@@ -551,7 +586,7 @@ static void ShareThink()
 		{
 			edict_t* o = PlayerAt(j);
 			if (o && IsAlive(o) && Has(ItemsOf(o->pvPrivateData), f))
-				g_RemoveInventoryItem(o->pvPrivateData, g_eng->pfnAllocString(f.c_str()), false);
+				g_RemoveInventoryItem(o->pvPrivateData, EngString(f), false);
 		}
 	}
 
@@ -563,9 +598,15 @@ static void ShareThink()
 			continue;
 		void* pl = o->pvPrivateData;
 		std::vector<std::string> cur = ItemsOf(pl);
-		for (const std::string& f : g_keyring)
-			if (!Has(cur, f))
-				GiveInvItem(pl, f); // inventario cheio: tenta de novo na proxima varredura
+		// inventario cheio: o AddToInventory falha (e manda mensagem ao cliente); tenta de novo so a cada 5 s
+		if (gpGlobals->time >= g_giveRetryAt[j])
+			for (const std::string& f : g_keyring)
+				if (!Has(cur, f) && !GiveInvItem(pl, f))
+				{
+					g_giveRetryAt[j] = gpGlobals->time + 5.0f;
+					Note("jogador %d: inventario sem espaco para '%s', tentando de novo em 5 s", j, f.c_str());
+					break;
+				}
 		g_seen[j] = ItemsOf(pl);
 		g_seenValid[j] = true;
 	}
@@ -578,8 +619,10 @@ static void ResetKeyring()
 	{
 		g_seen[i].clear();
 		g_seenValid[i] = false;
+		g_giveRetryAt[i] = 0;
 	}
 	g_nextShare = 0;
+	g_strings.clear(); // as strings do engine morreram com o mapa anterior
 }
 
 // ---------------------------------------------------------------- revive / respawn / checkpoints
@@ -1312,11 +1355,16 @@ static void HoldThink()
 	}
 }
 
-// cofmp_go: comeca o mapa sem esperar mais ninguem
+static bool CutWaiting();
+static void FireCutWait(const char* why);
+
+// cofmp_go: comeca o mapa (ou a cutscene) sem esperar mais ninguem
 static void Cmd_Go()
 {
 	if (g_hold.active)
 		ReleaseHold("cofmp_go");
+	if (CutWaiting())
+		FireCutWait("cofmp_go");
 }
 
 static bool IsTriggerEnt(edict_t* e)
@@ -1324,9 +1372,311 @@ static bool IsTriggerEnt(edict_t* e)
 	return !IsNull(e) && !strncmp(STRING(e->v.classname), "trigger_", 8);
 }
 
+// ---------------------------------------------------------------- imortal
+//
+// Motivos para um jogador nao tomar dano (esperando o grupo para uma cutscene, camera ligada). Enquanto houver
+// algum, takedamage fica DAMAGE_NO, FL_GODMODE ligado e a vida nao cai; quando o ultimo sai, volta como estava.
+
+enum { GOD_WAIT = 1, GOD_CAM = 2 };
+static struct
+{
+	int why;
+	float takedamage;
+	float health;
+} g_god[33];
+
+static void SetGod(int i, int why, bool on)
+{
+	if (i < 1 || i >= 33)
+		return;
+	edict_t* p = PlayerAt(i);
+	if (!p)
+	{
+		g_god[i] = {};
+		return;
+	}
+	int before = g_god[i].why;
+	g_god[i].why = on ? before | why : before & ~why;
+	if (!before && g_god[i].why)
+	{
+		g_god[i].takedamage = p->v.takedamage;
+		g_god[i].health = p->v.health;
+		p->v.takedamage = DAMAGE_NO;
+		p->v.flags |= FL_GODMODE;
+		Note("jogador %d imortal (%s)", i, why == GOD_WAIT ? "esperando o grupo" : "cutscene");
+	}
+	else if (before && !g_god[i].why)
+	{
+		p->v.takedamage = g_god[i].takedamage;
+		p->v.flags &= ~FL_GODMODE;
+		Note("jogador %d mortal de novo", i);
+	}
+}
+
+static int g_camOwner; // jogador que disparou a camera (0 = nenhuma)
+
+// o jogo pode mexer no takedamage (renascer, scripts): reforca a cada frame
+static void GodThink()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		if ((g_god[i].why & GOD_CAM) && !g_camOwner) // camera desligou sem passar pelo SetView
+			SetGod(i, GOD_CAM, false);
+		if (!g_god[i].why)
+			continue;
+		edict_t* p = PlayerAt(i);
+		if (!p || !IsAlive(p))
+			continue;
+		p->v.takedamage = DAMAGE_NO;
+		p->v.flags |= FL_GODMODE;
+		if (p->v.health < g_god[i].health)
+			p->v.health = g_god[i].health;
+		else
+			g_god[i].health = p->v.health;
+	}
+}
+
+static void ResetGod()
+{
+	memset(g_god, 0, sizeof(g_god));
+}
+
+// ---------------------------------------------------------------- espera antes das cutscenes
+//
+// No SP a cutscene comeca quando o jogador entra num trigger_once/trigger_multiple cuja cadeia de alvos
+// (multi_manager, trigger_relay) chega num trigger_camera. Em co-op, quem chega primeiro fica parado e imortal
+// dentro do gatilho ate todos os vivos chegarem perto dele; ai o gatilho dispara normalmente.
+// O host pode liberar antes com cofmp_go (Home > Comecar agora).
+
+struct EntKV
+{
+	std::string cls, name, master;
+	int spawnflags = 0;
+	std::vector<std::string> outs; // nomes que ele dispara
+};
+static std::unordered_map<int, EntKV> g_kv; // por indice do edict, lido no KeyValue
+static std::unordered_map<int, std::string> g_cutTrig; // gatilho de cutscene -> camera
+
+static void RecordKeyValue(edict_t* ent, KeyValueData* kvd)
+{
+	EntKV& e = g_kv[g_eng->pfnIndexOfEdict(ent)];
+	e.cls = kvd->szClassName;
+	const char* k = kvd->szKeyName;
+	if (!_stricmp(k, "targetname"))
+		e.name = kvd->szValue;
+	else if (!_stricmp(k, "target"))
+		e.outs.push_back(kvd->szValue);
+	else if (!_stricmp(k, "master"))
+		e.master = kvd->szValue;
+	else if (!_stricmp(k, "spawnflags"))
+		e.spawnflags = atoi(kvd->szValue);
+	else if (!_stricmp(e.cls.c_str(), "multi_manager") && _stricmp(k, "classname") && _stricmp(k, "origin") &&
+		_stricmp(k, "wait") && _stricmp(k, "delay") && _stricmp(k, "killtarget") && _strnicmp(k, "zhlt", 4))
+	{
+		std::string t = k; // "alvo#2" = segundo disparo do mesmo alvo
+		size_t h = t.find('#');
+		if (h != std::string::npos)
+			t.resize(h);
+		e.outs.push_back(t);
+	}
+}
+
+static void FindCutsceneTriggers()
+{
+	g_cutTrig.clear();
+	std::unordered_map<std::string, std::vector<int>> byName;
+	for (auto& kv : g_kv)
+		if (!kv.second.name.empty())
+			byName[kv.second.name].push_back(kv.first);
+	for (auto& kv : g_kv)
+	{
+		const EntKV& t = kv.second;
+		// spawnflags 2 = "no clients"; com master (multisource) o gatilho pode estar travado: nao segura ninguem
+		if ((_stricmp(t.cls.c_str(), "trigger_once") && _stricmp(t.cls.c_str(), "trigger_multiple")) ||
+			(t.spawnflags & 2) || !t.master.empty())
+			continue;
+		std::vector<std::pair<std::string, int>> q;
+		for (const std::string& o : t.outs)
+			q.push_back({ o, 0 });
+		std::vector<std::string> seen;
+		std::string cam;
+		for (size_t n = 0; n < q.size() && cam.empty(); n++)
+		{
+			if (q[n].second > 6 || Has(seen, q[n].first))
+				continue;
+			seen.push_back(q[n].first);
+			for (int idx : byName[q[n].first])
+			{
+				const EntKV& x = g_kv[idx];
+				if (!_stricmp(x.cls.c_str(), "trigger_camera"))
+				{
+					cam = q[n].first;
+					break;
+				}
+				if (!_stricmp(x.cls.c_str(), "multi_manager") || !_stricmp(x.cls.c_str(), "trigger_relay"))
+					for (const std::string& o : x.outs)
+						q.push_back({ o, q[n].second + 1 });
+			}
+		}
+		if (!cam.empty())
+			g_cutTrig[kv.first] = cam;
+	}
+	g_kv.clear();
+}
+
+static struct
+{
+	edict_t* trig; // gatilho segurado agora
+	bool waiting[33]; // jogadores parados nele
+	bool frozen[33]; // congelados por nos
+	float nextMsg;
+} g_cut;
+
+static bool CutWaiting()
+{
+	return g_cut.trig != NULL;
+}
+
+static bool NearTrigger(edict_t* p, edict_t* trig)
+{
+	const float m = 96.0f;
+	for (int k = 0; k < 3; k++)
+		if (p->v.absmin[k] > trig->v.absmax[k] + m || p->v.absmax[k] < trig->v.absmin[k] - m)
+			return false;
+	return true;
+}
+
+static void EndCutWait(const char* why)
+{
+	for (int k = 1; k < 33; k++)
+	{
+		edict_t* o = k <= gpGlobals->maxClients ? PlayerAt(k) : NULL;
+		if (o && g_cut.frozen[k])
+			o->v.flags &= ~FL_FROZEN;
+		if (g_cut.waiting[k])
+			SetGod(k, GOD_WAIT, false);
+	}
+	if (g_cut.trig && why)
+	{
+		Log("cutscene: gatilho #%d liberado (%s)", g_eng->pfnIndexOfEdict(g_cut.trig), why);
+		CenterPrintAll(" ");
+	}
+	memset(&g_cut, 0, sizeof(g_cut));
+}
+
+// true = segura o toque
+static bool CutWaitTouch(edict_t* trig, edict_t* pl)
+{
+	if (!cv_enable.value || !cv_cutscene_wait.value || gpGlobals->maxClients <= 1 || !IsPlayer(pl) || !IsAlive(pl) ||
+		(pl->v.flags & FL_FAKECLIENT))
+		return false;
+	auto it = g_cutTrig.find(g_eng->pfnIndexOfEdict(trig));
+	if (it == g_cutTrig.end())
+		return false;
+	if (g_cut.trig && g_cut.trig != trig)
+		return true; // outro gatilho de cutscene ja esta esperando: um de cada vez
+	int i = g_eng->pfnIndexOfEdict(pl);
+	if (!g_cut.trig)
+	{
+		g_cut.trig = trig;
+		Log("cutscene: '%s' chegou no gatilho #%d (camera '%s'); esperando o grupo", STRING(pl->v.netname),
+			g_eng->pfnIndexOfEdict(trig), it->second.c_str());
+	}
+	if (!g_cut.waiting[i])
+	{
+		g_cut.waiting[i] = true;
+		SetGod(i, GOD_WAIT, true);
+	}
+	if (!(pl->v.flags & FL_FROZEN))
+	{
+		pl->v.flags |= FL_FROZEN;
+		pl->v.velocity = Vector(0, 0, 0);
+		g_cut.frozen[i] = true;
+	}
+	return true;
+}
+
+// dispara o gatilho segurado como se o primeiro que chegou tivesse acabado de tocar nele
+static void FireCutWait(const char* why)
+{
+	edict_t* trig = g_cut.trig;
+	edict_t* act = NULL;
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33 && !act; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (o && g_cut.waiting[k] && IsAlive(o))
+			act = o;
+	}
+	g_cutTrig.erase(g_eng->pfnIndexOfEdict(trig)); // trigger_multiple nao segura de novo
+	EndCutWait(why);
+	if (act)
+		g_orig.pfnTouch(trig, act);
+}
+
+static void CutWaitThink()
+{
+	if (!g_cut.trig)
+		return;
+	if (IsNull(g_cut.trig) || g_cut.trig->free)
+	{
+		EndCutWait("gatilho sumiu");
+		return;
+	}
+	// todo humano no servidor conta, inclusive quem esta morto esperando renascer (cofmp_cutscene_wait 2: bots
+	// tambem, para testar sozinho)
+	int all = 0, here = 0, waitingAlive = 0;
+	std::string missing;
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (!o || ((o->v.flags & FL_FAKECLIENT) && cv_cutscene_wait.value < 2))
+			continue;
+		all++;
+		bool alive = IsAlive(o);
+		if (g_cut.waiting[k] && alive)
+			waitingAlive++;
+		if (alive && (g_cut.waiting[k] || NearTrigger(o, g_cut.trig)))
+			here++;
+		else if (missing.size() < 80)
+			missing += std::string(missing.empty() ? "" : ", ") + STRING(o->v.netname) + (alive ? "" : " (morto)");
+	}
+	if (!waitingAlive)
+	{
+		EndCutWait("ninguem mais esperando");
+		return;
+	}
+	if (here >= all)
+	{
+		char why[64];
+		_snprintf(why, sizeof(why), "todos chegaram: %d/%d", here, all);
+		why[sizeof(why) - 1] = 0;
+		FireCutWait(why);
+		return;
+	}
+	if (gpGlobals->time < g_cut.nextMsg)
+		return;
+	g_cut.nextMsg = gpGlobals->time + 1.0f;
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (!o || (o->v.flags & FL_FAKECLIENT))
+			continue;
+		char msg[200];
+		if (g_cut.waiting[k])
+			_snprintf(msg, sizeof(msg), "Esperando o grupo para a cutscene (%d/%d)\nFaltam: %s\nO host pode comecar antes: Home > Comecar agora",
+				here, all, missing.c_str());
+		else
+			_snprintf(msg, sizeof(msg), "Seu grupo esta esperando voce para uma cutscene (%d/%d)", here, all);
+		msg[sizeof(msg) - 1] = 0;
+		g_eng->pfnClientPrintf(o, print_center, msg);
+	}
+}
+
 static void Hook_Touch(edict_t* touched, edict_t* other)
 {
 	if (g_hold.active && ((IsTriggerEnt(touched) && IsPlayer(other)) || (IsTriggerEnt(other) && IsPlayer(touched))))
+		return;
+	if (!IsNull(touched) && !IsNull(other) && CutWaitTouch(touched, other))
 		return;
 	g_orig.pfnTouch(touched, other);
 }
@@ -1355,6 +1705,7 @@ static void Hook_GameInit()
 	g_eng->pfnCVarRegister(&cv_model);
 	g_eng->pfnCVarRegister(&cv_start_wait);
 	g_eng->pfnCVarRegister(&cv_start_timeout);
+	g_eng->pfnCVarRegister(&cv_cutscene_wait);
 	g_eng->pfnAddServerCommand((char*)"cofmp_exits", Cmd_Exits);
 	g_eng->pfnAddServerCommand((char*)"cofmp_tp_exit", Cmd_TpExit);
 	g_eng->pfnAddServerCommand((char*)"cofmp_debug", Cmd_Debug);
@@ -1379,14 +1730,19 @@ static void Hook_KeyValue(edict_t* ent, KeyValueData* kvd)
 		if (!_stricmp(kvd->szClassName, "worldspawn"))
 		{
 			g_changelevels.clear();
+			g_kv.clear();
 		}
-		else if (!_stricmp(kvd->szClassName, "trigger_changelevel"))
+		else
 		{
-			ChangeInfo& ci = g_changelevels[g_eng->pfnIndexOfEdict(ent)];
-			if (!_stricmp(kvd->szKeyName, "map"))
-				ci.map = kvd->szValue;
-			else if (!_stricmp(kvd->szKeyName, "landmark"))
-				ci.landmark = kvd->szValue;
+			RecordKeyValue(ent, kvd);
+			if (!_stricmp(kvd->szClassName, "trigger_changelevel"))
+			{
+				ChangeInfo& ci = g_changelevels[g_eng->pfnIndexOfEdict(ent)];
+				if (!_stricmp(kvd->szKeyName, "map"))
+					ci.map = kvd->szValue;
+				else if (!_stricmp(kvd->szKeyName, "landmark"))
+					ci.landmark = kvd->szValue;
+			}
 		}
 	}
 	g_orig.pfnKeyValue(ent, kvd);
@@ -1394,7 +1750,6 @@ static void Hook_KeyValue(edict_t* ent, KeyValueData* kvd)
 
 static void ResetCutscene();
 static void Hook_SetView(const edict_t* client, const edict_t* view);
-static int g_camOwner; // jogador que disparou a camera (0 = nenhuma)
 
 static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 {
@@ -1407,6 +1762,9 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	memset(g_unstickAt, 0, sizeof(g_unstickAt));
 	ResetKeyring();
 	ResetCutscene();
+	ResetGod();
+	memset(&g_cut, 0, sizeof(g_cut));
+	FindCutsceneTriggers();
 
 	const char* map = STRING(gpGlobals->mapname);
 	bool arrived = g_transit.pending && !_stricmp(map, g_transit.map.c_str());
@@ -1455,8 +1813,8 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 		g_eng->pfnServerCommand(cmd);
 	}
 
-	Log("mapa %s: %d trigger_changelevel%s%s", map, (int)g_changelevels.size(),
-		g_arrive.active ? ", posicionando jogadores pelo landmark" : "",
+	Log("mapa %s: %d trigger_changelevel, %d gatilho(s) de cutscene%s%s", map, (int)g_changelevels.size(),
+		(int)g_cutTrig.size(), g_arrive.active ? ", posicionando jogadores pelo landmark" : "",
 		restart ? ", reinicio: devolvendo inventarios do checkpoint" : "");
 }
 
@@ -1543,15 +1901,65 @@ static void UnstickThink()
 
 static void CamJoinThink();
 
+// ---------------------------------------------------------------- log de rede e desempenho
+//
+// A cada 10 s vai para o cofmp_log.txt o ping e a perda de cada jogador e os frames do servidor; um frame
+// que demora mais de 250 ms (travada) e anotado na hora.
+
+static void NetStatsThink()
+{
+	static LARGE_INTEGER freq, last, lastReport;
+	static int frames;
+	static double worst;
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	if (!freq.QuadPart)
+	{
+		QueryPerformanceFrequency(&freq);
+		last = lastReport = now;
+		return;
+	}
+	double dt = (double)(now.QuadPart - last.QuadPart) / freq.QuadPart;
+	last = now;
+	frames++;
+	if (dt > worst)
+		worst = dt;
+	if (dt > 0.25 && !g_changing && gpGlobals->maxClients > 1)
+		Note("servidor travou %.0f ms num frame (mapa %s)", dt * 1000, STRING(gpGlobals->mapname));
+	double span = (double)(now.QuadPart - lastReport.QuadPart) / freq.QuadPart;
+	if (span < 10.0 || gpGlobals->maxClients <= 1)
+		return;
+	char line[400];
+	int n = _snprintf(line, sizeof(line), "10s: servidor %.0f fps (pior frame %.0f ms)", frames / span, worst * 1000);
+	for (int k = 1; k <= gpGlobals->maxClients && k < 33 && n > 0 && n < (int)sizeof(line) - 80; k++)
+	{
+		edict_t* o = PlayerAt(k);
+		if (!o || (o->v.flags & FL_FAKECLIENT))
+			continue;
+		int ping = 0, loss = 0;
+		g_eng->pfnGetPlayerStats(o, &ping, &loss);
+		n += _snprintf(line + n, sizeof(line) - n, "; %d '%.20s' ping %d perda %d%%%s", k, STRING(o->v.netname), ping,
+			loss, IsAlive(o) ? "" : " (morto)");
+	}
+	line[sizeof(line) - 1] = 0;
+	Note("%s", line);
+	frames = 0;
+	worst = 0;
+	lastReport = now;
+}
+
 static void Hook_StartFrame()
 {
 	Hud_RunPending();
 	g_orig.pfnStartFrame();
 	AfterThink();
+	NetStatsThink();
 	if (!cv_enable.value || gpGlobals->maxClients <= 1)
 		return;
 	BotThink();
 	HoldThink();
+	CutWaitThink();
+	GodThink();
 	CamJoinThink();
 	GatherThink();
 	ArriveThink();
@@ -1589,6 +1997,53 @@ static void Hook_ClientPutInServer(edict_t* e)
 {
 	g_orig.pfnClientPutInServer(e);
 	ForceModel(e, g_eng->pfnGetInfoKeyBuffer(e));
+	Log("jogador %d '%s' entrou no mapa", g_eng->pfnIndexOfEdict(e), STRING(e->v.netname));
+}
+
+static qboolean Hook_ClientConnect(edict_t* e, const char* name, const char* addr, char reject[128])
+{
+	qboolean ok = g_orig.pfnClientConnect(e, name, addr, reject);
+	Log("conexao do jogador %d '%s' (%s)%s%s", g_eng->pfnIndexOfEdict(e), name, addr, ok ? "" : " recusada: ",
+		ok ? "" : reject);
+	return ok;
+}
+
+// Comandos que o cliente manda (inventario, usar item, trocar arma...). O mesmo comando so volta ao log depois
+// de 30 s, com quantas vezes veio nesse meio tempo (o cliente manda "VModEnable 1"/"vban 0" a cada 0,3 s).
+static void Hook_ClientCommand(edict_t* e)
+{
+	int i = g_eng->pfnIndexOfEdict(e);
+	if (i > 0 && i < 33)
+	{
+		struct Seen
+		{
+			double at;
+			int count;
+		};
+		static std::unordered_map<std::string, Seen> seen[33];
+		std::string cmd = g_eng->pfnCmd_Argv(0);
+		const char* args = g_eng->pfnCmd_Args();
+		if (args && *args)
+			cmd += std::string(" ") + args;
+		if (cmd.size() > 200)
+			cmd.resize(200);
+		Seen& s = seen[i][cmd];
+		double now = Plat_Time();
+		if (!s.at || now - s.at >= 30.0)
+		{
+			if (s.count)
+				Note("jogador %d: comando '%s' (mais %d vez(es) nos ultimos 30 s)", i, cmd.c_str(), s.count);
+			else
+				Note("jogador %d: comando '%s'", i, cmd.c_str());
+			s.at = now;
+			s.count = 0;
+		}
+		else
+			s.count++;
+		if (seen[i].size() > 500)
+			seen[i].clear();
+	}
+	g_orig.pfnClientCommand(e);
 }
 
 static void Hook_ClientDisconnect(edict_t* e)
@@ -1608,6 +2063,9 @@ static void Hook_ClientDisconnect(edict_t* e)
 		if (g_camOwner == i)
 			Hook_SetView(e, e); // devolve a visao dos outros
 		g_hold.frozen[i] = false;
+		g_cut.waiting[i] = false;
+		g_cut.frozen[i] = false;
+		g_god[i] = {};
 		if (!g_hold.active && !(e->v.flags & FL_FAKECLIENT) && g_humansLast > 0)
 			g_humansLast--;
 		Log("jogador %d desconectou (foto do inventario %s)", i, g_inv[i].valid ? "mantida" : "vazia");
@@ -1642,6 +2100,8 @@ static void BuildTable(DLL_FUNCTIONS* out)
 	out->pfnClientDisconnect = Hook_ClientDisconnect;
 	out->pfnClientUserInfoChanged = Hook_ClientUserInfoChanged;
 	out->pfnClientPutInServer = Hook_ClientPutInServer;
+	out->pfnClientConnect = Hook_ClientConnect;
+	out->pfnClientCommand = Hook_ClientCommand;
 	out->pfnTouch = Hook_Touch;
 	out->pfnThink = Hook_Think;
 	InstallDetour();
@@ -1670,11 +2130,13 @@ static void Hook_SetView(const edict_t* client, const edict_t* view)
 		g_camOwner = i;
 		g_camView = (edict_t*)view;
 		int n = 0;
+		SetGod(i, GOD_CAM, true); // durante a cena ninguem morre
 		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
 		{
 			edict_t* o = PlayerAt(k);
 			if (k == i || !o || !IsAlive(o) || (o->v.flags & FL_FAKECLIENT))
 				continue;
+			SetGod(k, GOD_CAM, true);
 			n++;
 			g_eng->pfnSetView(o, view);
 			if (client->v.flags & FL_FROZEN)
@@ -1685,6 +2147,8 @@ static void Hook_SetView(const edict_t* client, const edict_t* view)
 	}
 	else if (!on && g_camOwner == i)
 	{
+		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
+			SetGod(k, GOD_CAM, false);
 		for (int k = 1; k <= gpGlobals->maxClients && k < 33; k++)
 		{
 			edict_t* o = PlayerAt(k);
@@ -1719,6 +2183,7 @@ static void CamJoinThink()
 		if (owner->v.flags & FL_FROZEN)
 			o->v.flags |= FL_FROZEN;
 		g_camShared[k] = true;
+		SetGod(k, GOD_CAM, true);
 		Log("cutscene: jogador %d chegou no meio da cena e ve a camera '%s'", k, STRING(g_camView->v.targetname));
 	}
 }
@@ -1782,7 +2247,20 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	gpGlobals = globals;
 	static bool dumpInstalled;
 	if (!dumpInstalled)
+	{
 		dumpInstalled = AddVectoredExceptionHandler(0, CrashDumpHandler) != NULL;
+		// log em ...\cryoffear\cofmp_log.txt (a dll fica em cryoffear\cl_dlls)
+		char dir[MAX_PATH];
+		HMODULE self;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)&CrashDumpHandler, &self);
+		GetModuleFileNameA(self, dir, sizeof(dir));
+		for (int up = 0; up < 2; up++)
+			if (char* s = strrchr(dir, '\\'))
+				*s = 0;
+		LogFile_Open(dir);
+		LogFile_Write("jogo", "---- cofmp v" COFMP_VERSION " carregado");
+	}
 	Hud_Start(HudCommand);
 	if (!LoadHL())
 		return;

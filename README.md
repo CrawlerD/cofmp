@@ -58,9 +58,20 @@ Os outros jogadores abrem o Cry of Fear e digitam no console (tecla `'`) `connec
 
 ### Janela do co-op no jogo (tecla Home)
 Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partida).
-- **Hospedar:** escolha o número de jogadores e o mapa (padrão: 2 e `c_intro`) e clique em "Criar servidor". A DLL roda `disconnect; sv_lan 0; maxplayers N; map X`, abre o túnel em modo host e mostra o código, que já vai para a área de transferência.
-- **Entrar:** cole o código (se ele já estiver copiado, aparece sozinho) e clique em "Entrar". O túnel conecta e, 3 s depois, a DLL roda `connect 127.0.0.1:27020`.
-- **Começar agora:** roda `cofmp_go`, que solta a espera do grupo (abaixo) sem aguardar os outros.
+- **Hospedar:** escolha o número de jogadores e o mapa (padrão: 2 e `c_intro`) e clique em "Criar servidor". A DLL roda `disconnect; sv_lan 1; sv_lan_rate 100000; maxplayers N; map X`, abre o túnel em modo host e mostra o código, que já vai para a área de transferência.
+- **Entrar:** cole o código (se ele já estiver copiado, aparece sozinho) e clique em "Entrar". Quando o túnel do host responde, a DLL roda `rate 100000; cl_cmdrate 60; cl_updaterate 30; connect 127.0.0.1:27020`.
+- **Começar agora:** roda `cofmp_go`, que solta a espera do grupo ou da cutscene (abaixo) sem aguardar os outros.
+
+**Sem VAC (v1.8):** no `hw.dll`, o servidor é seguro quando não há `-insecure` na linha de comando e `sv_lan` é 0. Por isso o servidor do Home abre com `sv_lan 1`. O amigo chega pelo túnel como 127.0.0.1, que conta como LAN, e entra normalmente. Por IP direto da internet não entra com `sv_lan 1`: para isso use o instalador (opção 3), que abre o jogo com `-insecure`. Com `sv_lan 1`, a banda de cada cliente é limitada por `sv_lan_rate`, que vale 20000 por padrão; o Home sobe para 100000.
+
+**Espera antes das cutscenes (v1.8):** no `ServerActivate`, a DLL procura os `trigger_once`/`trigger_multiple` cuja cadeia de alvos (`target`, chaves do `multi_manager`, `trigger_relay`, até 6 níveis) chega numa `trigger_camera`. Ficam de fora os gatilhos com `master` (podem estar travados) e os com a flag "no clients". Quem toca um desses primeiro fica congelado e imortal dentro dele, e o toque é segurado. Quando todos os humanos do servidor estão vivos a até 96 unidades do gatilho, o `Touch` é chamado com o primeiro que chegou. Quem está morto também conta, então o grupo espera essa pessoa renascer. O host pode soltar antes com `cofmp_go`. Enquanto uma `trigger_camera` está ligada, todos ficam imortais: `takedamage` vai para `DAMAGE_NO`, `FL_GODMODE` liga e a vida não cai. Os valores de antes voltam quando a câmera desliga. Desliga com `cofmp_cutscene_wait 0`. Com `2`, os bots também contam, para testar sozinho.
+
+**Log (v1.8):** o `cofmp.dll` e o túnel escrevem em `cryoffear\cofmp_log.txt`, com as tags `[jogo]` e `[tunel]`. Passando de 5 MB, o arquivo vira `cofmp_log_anterior.txt`. O log tem:
+- tudo o que sai como `[cofmp]` no console;
+- conexões e comandos dos clientes (repetições seguidas viram uma linha só);
+- a cada 10 s, ping e perda de cada jogador e os fps do servidor;
+- frames do servidor com mais de 250 ms;
+- do túnel, a cada 10 s: pacotes, bytes e pedaços enviados e recebidos e o estado P2P (relay ou direto, e a fila da Steam).
 
 **Espera do grupo (v1.5):** ao carregar um mapa, o servidor congela os jogadores e segura os `trigger_*` (toque e `trigger_auto`) até nascerem `maxplayers` humanos. Depois de uma troca de mapa, espera quantos estavam no mapa anterior, por no máximo `cofmp_start_timeout` segundos (90 por padrão). Sem isso, o host nascia sozinho e a cutscene de abertura do `c_intro` rodava antes do amigo entrar. Desliga com `cofmp_start_wait 0`. Quem chega com uma `trigger_camera` ativa passa a ver a câmera também.
 
@@ -77,6 +88,8 @@ Como funciona por dentro:
 O `CoF_Tunel.exe` (com o `steam_api.dll` ao lado) leva o tráfego do jogo pela rede P2P da Steam. Ele se identifica como o próprio Cry of Fear (appid 223710). A Steam passou a recusar o appid 480 (Spacewar), e todo mundo que joga o mod já tem o Cry of Fear. Não precisa de VPN nem de porta aberta.
 
 Como o `cof.exe` também roda como 223710 e drena os callbacks da Steam com `Steam_BGetCallback`, o `P2PSessionRequest_t` pode não chegar ao túnel. Por isso o host chama `AcceptP2PSessionWithUser` a cada 2 s para os amigos que estão jogando o appid 223710 (`GetFriendGamePlayed`). Sem pedido pendente, esse Accept abre uma conexão para o amigo. Se a conexão falha, ele fica 1 min sem ser chamado, e a falha não aparece na janela. No canal P2P 1, o join manda `cofmp <versão>` até o host responder. Quando ele responde, o túnel grava `conectado.txt`, e a janela do Home só manda o `connect` depois disso (ou após 45 s). Os dois lados mostram a versão do outro.
+
+Pacotes do jogo com mais de 1200 bytes, o limite do envio sem confirmação da Steam, vão em pedaços sem confirmação. Cada pedaço leva o cabeçalho `FD FF FF FF <id:2> <i:1> <n:1>`, e o outro túnel remonta o pacote. Até a v1.7 esses pacotes iam pela fila confiável e chegavam depois dos pacotes pequenos enviados depois deles. O netchan descartava os grandes por chegarem fora de ordem, e eram eles que levavam os comandos e eventos. Isso causava o lag em tudo que não era andar.
 1. **Host:** no instalador, opção **3**. O jogo abre hospedando e o túnel abre junto, mostrando um código (já copiado) para mandar ao amigo.
 2. **Amigo:** no instalador, opção **4**. Ele cola o código, o túnel conecta e o jogo abre com `connect 127.0.0.1:27020`. Se não entrar, é só repetir esse comando no console.
 
@@ -97,6 +110,8 @@ Se o jogo crashar com o mod carregado (no PC de quem hospeda), o mod grava `cryo
 | `cofmp_share_items 1` | 1 = chaves/itens pegos por um jogador vão para todos |
 | `cofmp_model simon` | modelo forçado em todos os jogadores (vazio = deixa o do jogo) |
 | `cofmp_respawn_time 30` | segundos até o jogador caído renascer sozinho perto do grupo, se ninguém reviver (0 = só por revive ou pulando) |
+| `cofmp_cutscene_wait 1` | 1 = gatilho de cutscene espera todos chegarem perto (quem chega fica parado e imortal); 0 = desliga; 2 = conta bots também (testes) |
+| `cofmp_go` | solta a espera do começo do mapa ou da cutscene sem aguardar os outros (Home > Começar agora) |
 | `cofmp_debug` | estado dos slots de jogador |
 | `cofmp_inv` | chaveiro do grupo, armas, munição e slots de inventário de cada jogador |
 | `cofmp_bot [nome]` | cria um bot parado (testes com 1 pessoa só) |

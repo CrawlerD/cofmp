@@ -12,6 +12,8 @@
 #include <string>
 #include <map>
 #include <iostream>
+#include <vector>
+#include "../logfile.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
@@ -111,6 +113,33 @@ static const char* Name(CSteamID id)
 	return n && *n ? n : "?";
 }
 
+// printf que tambem vai para o cofmp_log.txt
+static void Out(const char* fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	_vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+	va_end(ap);
+	buf[sizeof(buf) - 1] = 0;
+	fputs(buf, stdout);
+	const char* s = buf + strspn(buf, " \n");
+	if (*s)
+		LogFile_Write("tunel", s);
+}
+
+// so no log
+static void Note(const char* fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	_vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+	va_end(ap);
+	buf[sizeof(buf) - 1] = 0;
+	LogFile_Write("tunel", buf);
+}
+
 class SessionRequest : public CCallbackBase
 {
 public:
@@ -121,7 +150,7 @@ public:
 		if (g_host || id.v == g_peer.v)
 		{
 			g_net->AcceptP2PSessionWithUser(id);
-			printf("  Conexao P2P aceita: %s\n", Name(id));
+			Out("  Conexao P2P aceita: %s\n", Name(id));
 		}
 	}
 	void Run(void* p, bool, uint64_t) override { Run(p); }
@@ -136,9 +165,92 @@ public:
 	int GetCallbackSizeBytes() override { return 12; }
 };
 
+// Pacote do jogo maior que 1200 bytes vai em pedacos sem confirmacao, com o cabecalho FD FF FF FF <id:2> <i:1> <n:1>.
+// Mandar esses pela fila confiavel da Steam (como ate a v1.7) fazia eles chegarem depois dos pequenos que vieram
+// atras; o netchan do jogo descarta pacote fora de ordem, e eram justamente os grandes que levavam os comandos e
+// eventos (tiro, inventario...), reenviados varias vezes ate passar: o "lag" de tudo que nao e andar.
+// Um pedaco perdido perde o pacote inteiro, que o netchan trata como perda comum. O 0xFFFFFFFD nunca e o comeco
+// de um pacote do jogo (sequencia 0x3FFFFFFD; os sem conexao comecam com FF FF FF FF).
+static const uint8_t FRAG_MAGIC[4] = { 0xFD, 0xFF, 0xFF, 0xFF };
+static const uint32_t FRAG_HDR = 8, FRAG_DATA = MAX_UNRELIABLE - FRAG_HDR;
+
+static struct
+{
+	uint32_t pktOut, pktIn, bytesOut, bytesIn, fragOut, fragIn, fragLost, sendFail;
+} g_stats;
+
 static void Send(CSteamID to, const char* data, int len)
 {
-	g_net->SendP2PPacket(to, data, len, (uint32_t)len <= MAX_UNRELIABLE ? P2P_UNRELIABLE : P2P_RELIABLE, CH_GAME);
+	g_stats.pktOut++;
+	g_stats.bytesOut += len;
+	if ((uint32_t)len <= MAX_UNRELIABLE)
+	{
+		if (!g_net->SendP2PPacket(to, data, len, P2P_UNRELIABLE, CH_GAME))
+			g_stats.sendFail++;
+		return;
+	}
+	static uint16_t nextId;
+	uint16_t id = nextId++;
+	uint32_t count = (len + FRAG_DATA - 1) / FRAG_DATA;
+	if (count > 255)
+		return;
+	char frag[MAX_UNRELIABLE];
+	for (uint32_t i = 0; i < count; i++)
+	{
+		uint32_t off = i * FRAG_DATA, n = min((uint32_t)len - off, FRAG_DATA);
+		memcpy(frag, FRAG_MAGIC, 4);
+		memcpy(frag + 4, &id, 2);
+		frag[6] = (char)i;
+		frag[7] = (char)count;
+		memcpy(frag + FRAG_HDR, data + off, n);
+		if (!g_net->SendP2PPacket(to, frag, FRAG_HDR + n, P2P_UNRELIABLE, CH_GAME))
+			g_stats.sendFail++;
+		g_stats.fragOut++;
+	}
+}
+
+// remonta um pacote em pedacos; um por remetente (os pedacos de um pacote vem em sequencia)
+struct Assembly
+{
+	uint16_t id;
+	uint32_t count, have;
+	std::vector<std::string> parts;
+};
+static std::map<uint64_t, Assembly> g_assembly;
+
+// true quando data/len e um pacote inteiro do jogo (pedaco que completou o pacote ou pacote normal)
+static bool Reassemble(CSteamID from, const char*& data, uint32_t& len, std::string& whole)
+{
+	if (len < FRAG_HDR || memcmp(data, FRAG_MAGIC, 4))
+		return true;
+	g_stats.fragIn++;
+	uint16_t id;
+	memcpy(&id, data + 4, 2);
+	uint32_t i = (uint8_t)data[6], count = (uint8_t)data[7];
+	if (!count || i >= count)
+		return false;
+	Assembly& a = g_assembly[from.v];
+	if (a.parts.empty() || a.id != id || a.count != count)
+	{
+		if (!a.parts.empty() && a.have < a.count)
+			g_stats.fragLost++;
+		a.id = id;
+		a.count = count;
+		a.have = 0;
+		a.parts.assign(count, std::string());
+	}
+	if (!a.parts[i].empty())
+		return false;
+	a.parts[i].assign(data + FRAG_HDR, len - FRAG_HDR);
+	if (++a.have < a.count)
+		return false;
+	whole.clear();
+	for (const std::string& p : a.parts)
+		whole += p;
+	a.parts.clear();
+	data = whole.data();
+	len = (uint32_t)whole.size();
+	return true;
 }
 
 static void SendHello(CSteamID to)
@@ -185,7 +297,7 @@ void ConnectFail::Run(void* p)
 	}
 	if (!g_host && id.v != g_peer.v)
 		return;
-	printf("  Falha na conexao P2P com %s (erro %d). Confira o codigo e se o outro lado esta com o tunel aberto.\n",
+	Out("  Falha na conexao P2P com %s (erro %d). Confira o codigo e se o outro lado esta com o tunel aberto.\n",
 		Name(id), ((uint8_t*)p)[8]);
 }
 
@@ -225,7 +337,7 @@ static void CopyToClipboard(const std::string& s)
 
 static std::string Ask(const char* prompt)
 {
-	printf("%s", prompt);
+	Out("%s", prompt);
 	std::string s;
 	std::getline(std::cin, s);
 	size_t a = s.find_first_not_of(" \t\r\""), b = s.find_last_not_of(" \t\r\"");
@@ -234,7 +346,7 @@ static std::string Ask(const char* prompt)
 
 static int Fail(const char* msg)
 {
-	printf("\n  ERRO: %s\n\n  Aperte Enter para sair.", msg);
+	Out("\n  ERRO: %s\n\n  Aperte Enter para sair.", msg);
 	std::string s;
 	std::getline(std::cin, s);
 	return 1;
@@ -250,15 +362,25 @@ int main(int argc, char** argv)
 {
 	SetConsoleOutputCP(CP_UTF8);
 	setvbuf(stdout, NULL, _IONBF, 0);
-	printf("==============================================\n");
-	printf("  Cry of Fear co-op - tunel pela Steam (v%s)\n", COFMP_VERSION);
-	printf("==============================================\n\n");
+	Out("==============================================\n");
+	Out("  Cry of Fear co-op - tunel pela Steam (v%s)\n", COFMP_VERSION);
+	Out("==============================================\n\n");
 
 	// a Steam identifica o app pelo steam_appid.txt da pasta atual
 	char dir[MAX_PATH];
 	GetModuleFileNameA(NULL, dir, MAX_PATH);
 	*strrchr(dir, '\\') = 0;
 	SetCurrentDirectoryA(dir);
+	{
+		// instalado: cryoffear\cl_dlls\cofmp_tunel -> log em cryoffear; rodando de outra pasta: log nela
+		char logDir[MAX_PATH];
+		strcpy(logDir, dir);
+		size_t L = strlen(logDir), S = strlen("\\cl_dlls\\cofmp_tunel");
+		if (L > S && !_stricmp(logDir + L - S, "\\cl_dlls\\cofmp_tunel"))
+			logDir[L - S] = 0;
+		LogFile_Open(logDir);
+	}
+	Note("---- tunel v%s aberto: %s", COFMP_VERSION, GetCommandLineA());
 	FILE* f = fopen("steam_appid.txt", "w");
 	if (f)
 	{
@@ -271,8 +393,8 @@ int main(int argc, char** argv)
 	std::string mode = argc > 1 ? argv[1] : "";
 	if (mode.empty())
 	{
-		printf("  1) Hospedar (quem abriu o servidor no jogo)\n");
-		printf("  2) Entrar no jogo de um amigo\n\n");
+		Out("  1) Hospedar (quem abriu o servidor no jogo)\n");
+		Out("  2) Entrar no jogo de um amigo\n\n");
 		mode = Ask("  Escolha: ") == "1" ? "host" : "join";
 	}
 	g_host = mode == "host";
@@ -341,10 +463,10 @@ int main(int argc, char** argv)
 			fclose(cf);
 		}
 		game.sin_port = htons(gamePort);
-		printf("  Tunel aberto como %s.\n\n", g_friends->GetPersonaName());
-		printf("  Codigo para o seu amigo:  %s\n", buf);
-		printf("  (ja foi copiado; mande para ele pelo chat da Steam)\n\n");
-		printf("  Deixe esta janela aberta enquanto jogam. Servidor local: 127.0.0.1:%d\n\n", gamePort);
+		Out("  Tunel aberto como %s.\n\n", g_friends->GetPersonaName());
+		Out("  Codigo para o seu amigo:  %s\n", buf);
+		Out("  (ja foi copiado; mande para ele pelo chat da Steam)\n\n");
+		Out("  Deixe esta janela aberta enquanto jogam. Servidor local: 127.0.0.1:%d\n\n", gamePort);
 	}
 	else
 	{
@@ -352,12 +474,13 @@ int main(int argc, char** argv)
 		if (listenSock == INVALID_SOCKET)
 			return Fail("a porta local ja esta em uso (outro tunel aberto?).");
 		DeleteFileA("conectado.txt"); // a janela do jogo (Home) espera este arquivo para mandar o connect
-		printf("  Conectando ao host %s pela Steam...\n\n", Name(g_peer));
-		printf("  Deixe esta janela aberta enquanto jogam.\n\n");
+		Out("  Conectando ao host %s pela Steam...\n\n", Name(g_peer));
+		Out("  Deixe esta janela aberta enquanto jogam.\n\n");
 	}
 
 	static char buf[65536];
-	DWORD lastCb = 0, lastStatus = 0, lastHello = 0, lastAccept = 0, start = timeGetTime();
+	std::string whole;
+	DWORD lastCb = 0, lastStatus = 0, lastHello = 0, lastAccept = 0, lastStats = 0, start = timeGetTime();
 	bool wasRelay = false, announced = false, hostAnswered = false, warned = false;
 
 	for (;;)
@@ -391,18 +514,18 @@ int main(int argc, char** argv)
 				if (!g_greeted[from.v])
 				{
 					g_greeted[from.v] = true;
-					printf("  %s abriu o tunel para entrar (v%s).\n", Name(from), ver.c_str());
+					Out("  %s abriu o tunel para entrar (v%s).\n", Name(from), ver.c_str());
 					if (ver != COFMP_VERSION)
-						printf("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);
+						Out("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);
 				}
 			}
 			else if (from.v == g_peer.v && !hostAnswered)
 			{
 				hostAnswered = true;
-				printf("  O tunel do host respondeu (v%s). Entrando no jogo...\n", ver.c_str());
+				Out("  O tunel do host respondeu (v%s). Entrando no jogo...\n", ver.c_str());
 				if (ver != COFMP_VERSION)
-					printf("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);
-				printf("  Se o jogo nao entrar sozinho, digite no console:  connect 127.0.0.1:%d\n\n", localPort);
+					Out("  AVISO: versoes diferentes (voce: v%s). Os dois devem rodar o ATUALIZAR.bat.\n", COFMP_VERSION);
+				Out("  Se o jogo nao entrar sozinho, digite no console:  connect 127.0.0.1:%d\n\n", localPort);
 				FILE* cf = fopen("conectado.txt", "w");
 				if (cf)
 					fclose(cf);
@@ -415,10 +538,10 @@ int main(int argc, char** argv)
 			if (!warned && now - start > 20000)
 			{
 				warned = true;
-				printf("  O tunel do host ainda nao respondeu. Confira:\n");
-				printf("   - o codigo e o do host e ele clicou em \"Criar servidor\" (o tunel dele tem que estar aberto);\n");
-				printf("   - os dois estao na mesma versao (esta e a v%s; o host ve a dele na janela do tunel);\n", COFMP_VERSION);
-				printf("   - voces sao amigos na Steam.\n  Continuo tentando...\n\n");
+				Out("  O tunel do host ainda nao respondeu. Confira:\n");
+				Out("   - o codigo e o do host e ele clicou em \"Criar servidor\" (o tunel dele tem que estar aberto);\n");
+				Out("   - os dois estao na mesma versao (esta e a v%s; o host ve a dele na janela do tunel);\n", COFMP_VERSION);
+				Out("   - voces sao amigos na Steam.\n  Continuo tentando...\n\n");
 			}
 		}
 
@@ -430,6 +553,11 @@ int main(int argc, char** argv)
 			if (!g_net->ReadP2PPacket(buf, sizeof(buf), &got, &from, CH_GAME))
 				break;
 			busy = true;
+			const char* pkt = buf;
+			if (!Reassemble(from, pkt, got, whole))
+				continue;
+			g_stats.pktIn++;
+			g_stats.bytesIn += got;
 			if (g_host)
 			{
 				auto it = peers.find(from.v);
@@ -439,13 +567,13 @@ int main(int argc, char** argv)
 					if (p.sock == INVALID_SOCKET)
 						continue;
 					it = peers.emplace(from.v, p).first;
-					printf("  %s entrou pelo tunel.\n", Name(from));
+					Out("  %s entrou pelo tunel.\n", Name(from));
 				}
 				it->second.last = now;
-				sendto(it->second.sock, buf, got, 0, (sockaddr*)&game, sizeof(game));
+				sendto(it->second.sock, pkt, got, 0, (sockaddr*)&game, sizeof(game));
 			}
 			else if (from.v == g_peer.v && haveGame)
-				sendto(listenSock, buf, got, 0, (sockaddr*)&game, sizeof(game));
+				sendto(listenSock, pkt, got, 0, (sockaddr*)&game, sizeof(game));
 		}
 
 		// jogo -> Steam
@@ -461,7 +589,7 @@ int main(int argc, char** argv)
 				}
 				if (now - it->second.last > 60000) // 1 min sem nada: o amigo saiu
 				{
-					printf("  %s saiu do tunel.\n", Name(CSteamID{ it->first }));
+					Out("  %s saiu do tunel.\n", Name(CSteamID{ it->first }));
 					closesocket(it->second.sock);
 					g_net->CloseP2PSessionWithUser(CSteamID{ it->first });
 					it = peers.erase(it);
@@ -489,11 +617,32 @@ int main(int argc, char** argv)
 				if (g_net->GetP2PSessionState(g_peer, &st) && st.connectionActive)
 				{
 					if (!announced || wasRelay != !!st.usingRelay)
-						printf("  Conectado ao host (%s).\n", st.usingRelay ? "pelos servidores da Steam" : "direto");
+						Out("  Conectado ao host (%s).\n", st.usingRelay ? "pelos servidores da Steam" : "direto");
 					announced = true;
 					wasRelay = !!st.usingRelay;
 				}
 			}
+		}
+		// a cada 10 s, no log: trafego e estado da conexao com cada um (fila da Steam cheia = conexao lenta)
+		if (now - lastStats >= 10000)
+		{
+			lastStats = now;
+			Note("10s: pacotes env %u (%u B, %u pedacos, %u falhas) rec %u (%u B, %u pedacos, %u perdidos)",
+				g_stats.pktOut, g_stats.bytesOut, g_stats.fragOut, g_stats.sendFail, g_stats.pktIn, g_stats.bytesIn,
+				g_stats.fragIn, g_stats.fragLost);
+			memset(&g_stats, 0, sizeof(g_stats));
+			auto state = [&](CSteamID id) {
+				P2PSessionState_t st = {};
+				if (g_net->GetP2PSessionState(id, &st))
+					Note("  %s: ativa %d conectando %d erro %d %s, fila %d B / %d pacotes", Name(id), st.connectionActive,
+						st.connecting, st.sessionError, st.usingRelay ? "pelo relay da Steam" : "direto", st.bytesQueued,
+						st.packetsQueued);
+			};
+			if (g_host)
+				for (auto& p : peers)
+					state(CSteamID{ p.first });
+			else
+				state(g_peer);
 		}
 		if (!busy)
 			Sleep(1);

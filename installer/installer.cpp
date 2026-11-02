@@ -405,7 +405,7 @@ static void Host(const std::string& game)
 	ReadLine(map);
 	if (map.empty() || map.find_first_of(" \"&|;") != std::string::npos)
 		map = "c_apartment1";
-	std::string args = "-game cryoffear -insecure +sv_lan 0 +maxplayers " + n + " +map " + map;
+	std::string args = "-game cryoffear -insecure +sv_lan 0 +sv_lan_rate 100000 +maxplayers " + n + " +map " + map;
 	ShellExecuteA(NULL, "open", (game + "\\cof.exe").c_str(), args.c_str(), game.c_str(), SW_SHOWNORMAL);
 	if (StartTunnel("host"))
 		printf("\n  Abrindo o servidor e o tunel da Steam. Mande para o seu amigo o codigo que aparece no tunel.\n");
@@ -430,7 +430,7 @@ static void Join(const std::string& game)
 		return;
 	}
 	Sleep(3000); // da tempo da Steam montar a conexao antes do jogo tentar conectar
-	ShellExecuteA(NULL, "open", (game + "\\cof.exe").c_str(), "-game cryoffear +connect 127.0.0.1:27020",
+	ShellExecuteA(NULL, "open", (game + "\\cof.exe").c_str(), "-game cryoffear +rate 100000 +cl_cmdrate 60 +connect 127.0.0.1:27020",
 		game.c_str(), SW_SHOWNORMAL);
 	printf("\n  Abrindo o jogo conectado ao host. Se ele nao entrar, digite no console:  connect 127.0.0.1:27020\n");
 }

@@ -28,6 +28,8 @@ Proxy do server DLL (`hl.dll`). O engine carrega `cofmp.dll`, que repassa todos 
 ## Instalar
 **Jeito fácil:** rode `dist\CoF_Coop_Mod.exe` e escolha 1 (instalar), 2 (desinstalar) ou 3 (hospedar). Ele acha o jogo nas bibliotecas da Steam sozinho. Só o host precisa do mod; quem entra usa o jogo normal.
 
+**FPS acima de 100 nos PCs de quem entra:** o host já destrava pelo mod. Quem entra não carrega o `cofmp.dll`, então use a opção **5** do instalador (ou `CoF_Coop_Mod.exe --fps --game "<pasta do jogo>"`) nesse PC. Ela troca um byte do `hw.dll` (`74 2C` → `EB 2C` no teste que corta o fps em 100), guarda o original em `cryoffear\Mod coop\hw.dll.orig` e cria o marcador `fps.on`. A opção **6** (ou `--fps-off`) desfaz. Verificar os arquivos na Steam pode reverter o patch; rode a opção 5 de novo depois. Não use em servidores com VAC.
+
 Manual:
 1. Rode `build.bat`, que gera `build\cofmp.dll`.
 2. Copie a DLL para `Cry of Fear\cryoffear\cl_dlls\`.
@@ -46,16 +48,22 @@ Ficam fora só o que o jogo procura num lugar fixo: `cl_dlls\cofmp.dll` (o `game
 ### Atualização automática
 Toda vez que abre, o `CoF_Coop_Mod.exe` consulta a última release do GitHub. Se a tag for mais nova que a versão dele, baixa os arquivos soltos da release para a própria pasta, troca os antigos e reabre já atualizado. Se o mod estava instalado, a DLL do jogo é trocada na hora (com o jogo fechado). Sem internet, ele segue com a versão que tem.
 
+Antes de trocar qualquer arquivo, o instalador confere o SHA-256 de cada download com o `digest` que a API do GitHub devolve. O instalador publicado usa uma chave RSA embutida (`kUpdatePubKeyPem`), então ele **só** aceita release com `SHA256SUMS` e `SHA256SUMS.sig` que confiram: um release trocado no GitHub não passa sem a chave privada.
+
 O `ATUALIZAR.bat`, que fica na mesma pasta, faz só isso sem abrir o menu: roda `CoF_Coop_Mod.exe --atualizar`. Esse comando atualiza o instalador e o túnel, troca a DLL do jogo (ou instala o mod, se ele não estiver instalado) e sai. O instalador não troca o próprio `.bat` na atualização, porque o `cmd` lê o arquivo aos poucos enquanto ele roda.
 
 ## Publicar uma versão
-Precisa do Visual Studio 2022 Build Tools, do SDK do Half-Life em `..\deps\halflife` (`git clone https://github.com/ValveSoftware/halflife ..\deps\halflife`), do `pefile` (`py -m pip install pefile`), do jogo instalado e do `gh` logado.
+O build local precisa do Visual Studio 2022 Build Tools e do SDK do Half-Life em `..\deps\halflife` (`git clone https://github.com/ValveSoftware/halflife ..\deps\halflife`). O `hl.dll` do jogo é opcional: sem ele, o `gen_def.py` usa `tools\hl_exports.txt`, a lista fixa dos 846 exports. Para regerar a lista com um `hl.dll` novo: `py gen_def.py --list <hl.dll>`.
+
+A CI (`.github/workflows/build.yml`) compila a DLL, o instalador e o túnel em Windows x86, roda os testes do instalador (`tools\test_installer.ps1`) e compara os hashes de dois builds para garantir o build reproduzível (`/Brepro`).
 
 ```
 release.bat 1.2 "o que mudou"
 ```
 
-Ele grava a versão em `VERSION`, compila a DLL, o instalador e o túnel, monta `dist\CoF_Coop_Mod.zip`, faz commit e push e cria a release `v1.2` com o zip (para quem baixa a primeira vez) e os arquivos soltos (que o instalador usa para se atualizar).
+Ele grava a versão em `VERSION`, compila a DLL, o instalador e o túnel, monta `dist\CoF_Coop_Mod.zip`, gera `dist\SHA256SUMS` e assina com `tools\sign_release.ps1` (chave em `tools\update_key.pem` ou `COFMP_UPDATE_KEY`; sem ela o script para, porque o instalador exige a assinatura). Depois faz commit e push e cria a release `v1.2` com o zip (para quem baixa a primeira vez), os arquivos soltos (que o instalador usa para se atualizar), o manifesto e a assinatura.
+
+O par de chaves do updater é gerado uma vez com `tools\gen_update_key.ps1`. A chave privada fica fora do repo (e com backup); a pública vai para `kUpdatePubKeyPem` em `installer\installer.cpp`. Trocar a chave invalida a atualização automática das versões antigas (elas continuam funcionando, só não se atualizam sozinhas).
 
 ## Jogar
 O host abre um servidor com o mapa inicial da campanha, por exemplo:
@@ -98,7 +106,7 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 
 **Painel nativo do co-op (v1.5):** o `client.dll` só desenha o painel "Nome - Health N - Ping N" com o ícone da seringa nos mapas `cof_*`. Em multiplayer, a DLL troca a string comparada por uma vazia, então o painel aparece também nos mapas da campanha (`c_*`).
 
-**FPS acima de 100:** o `Host_FilterTime` do `hw.dll` corta o fps em 100 quando `developer` é 0, mesmo com `fps_max 111` no `config.cfg` (o valor que o CoF grava). O mod troca o teste do `developer` por um salto, então o `fps_max` volta a valer e o jogo passa dos 100. O limite continua sendo o `fps_max` (72 por padrão); para trocar em jogo, use `cofmp_fps <n>` no console do host. Se o `hw.dll` não for a versão esperada, o patch se desliga sozinho e o jogo fica como antes.
+**FPS acima de 100:** o `Host_FilterTime` do `hw.dll` corta o fps em 100 quando `developer` é 0, mesmo com `fps_max 111` no `config.cfg` (o valor que o CoF grava). No host, o mod troca o teste do `developer` por um salto em memória, então o `fps_max` volta a valer e o jogo passa dos 100. O limite continua sendo o `fps_max` (72 por padrão); para trocar em jogo, use `cofmp_fps <n>` no console do host. Nos PCs de quem entra, que não carregam o `cofmp.dll`, a opção 5 do instalador aplica o mesmo patch no `hw.dll` em disco (a opção 6 desfaz). Se o `hw.dll` não for a versão esperada, o patch se desliga sozinho e o jogo fica como antes.
 
 Como funciona por dentro:
 - A janela é Win32 e roda numa thread do `cofmp.dll`, que o engine carrega no processo do jogo já no menu (`hud.cpp`).

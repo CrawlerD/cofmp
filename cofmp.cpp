@@ -2930,6 +2930,7 @@ static void CoopSave(const char* why, edict_t* asker)
 
 static const DWORD RVA_FPS_CLAMP = 0x7eb25;
 static const char SIG_FPS_CLAMP[] = "\x74\x2C\xD9\x45\xFC\xDC\x1D"; // je +0x2c; fld [ebp-4]; fcomp 100.0
+static const char SIG_FPS_UNLOCKED[] = "\xEB\x2C\xD9\x45\xFC\xDC\x1D"; // ja com o patch do instalador
 static bool g_fpsUnlocked;
 
 static bool UnlockFps()
@@ -2938,6 +2939,13 @@ static bool UnlockFps()
 		return true;
 	BYTE* hw = (BYTE*)GetModuleHandleA("hw.dll");
 	BYTE* p = hw ? hw + RVA_FPS_CLAMP : NULL;
+	if (p && SigMatch(p, SIG_FPS_UNLOCKED, sizeof(SIG_FPS_UNLOCKED) - 1))
+	{
+		// o instalador ja trocou o je por jmp no hw.dll em disco (opcao 5, para quem entra)
+		g_fpsUnlocked = true;
+		Log("fps acima de 100 ja liberado pelo patch do hw.dll");
+		return true;
+	}
 	if (!p || !SigMatch(p, SIG_FPS_CLAMP, sizeof(SIG_FPS_CLAMP) - 1))
 	{
 		Log("aviso: o Host_FilterTime do hw.dll nao confere (outra versao?) - fps acima de 100 desligado");

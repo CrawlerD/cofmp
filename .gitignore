@@ -3,3 +3,6 @@ dist/
 *.old
 *.new
 .claude/settings.local.json
+deps/
+.serena/
+tools/update_key.pem

@@ -1150,6 +1150,130 @@ static void ResetRespawn()
 	g_nextSnap = 0;
 }
 
+// ---------------------------------------------------------------- memoria dos mapas
+//
+// O SP salva o mapa ao sair (save da transicao) e o restaura na volta; no MP ele renasce do zero. Voltando do c_start2
+// ao c_start o cadeado estava fechado de novo e, aberto outra vez, trancava a porta (o cof_interdooronoff alterna a
+// trava), e o vulto do corredor seguia parado (o gatilho que o faz andar e sumir fica no caminho de quem vem do outro
+// lado). Ao sair de um mapa guardamos o que mudou desde que ele nasceu - entidades apagadas (gatilhos usados,
+// killtarget, itens pegos), monstros mortos, o que ficou visivel ou invisivel e a trava das inter_door - e, voltando
+// pelo landmark, reaplicamos. O mapa nasce sempre na mesma ordem, entao o indice da entidade (com a classe conferida)
+// identifica a mesma coisa entre uma visita e outra.
+static const int OFS_DOOR_LOCK = 0x190; // inter_door: string_t de quem a tranca (0 = destrancada)
+
+struct SpawnEnt
+{
+	std::string cls, lock;
+	bool named, monster, nodraw;
+};
+struct MapMem
+{
+	std::vector<int> gone;
+	std::vector<std::pair<int, bool>> nodraw;
+	std::vector<std::pair<int, std::string>> lock;
+};
+static std::vector<SpawnEnt> g_spawnEnts; // o mapa atual como nasceu, por indice de entidade
+static std::unordered_map<std::string, MapMem> g_mapMem;
+
+static std::string MapKey()
+{
+	std::string m = STRING(gpGlobals->mapname);
+	std::transform(m.begin(), m.end(), m.begin(), ::tolower);
+	return m;
+}
+
+static std::string DoorLock(edict_t* e)
+{
+	int s = e->pvPrivateData ? Field<int>(e->pvPrivateData, OFS_DOOR_LOCK) : 0;
+	return s ? STRING(s) : "";
+}
+
+static void MapMemSnapshot()
+{
+	g_spawnEnts.assign(gpGlobals->maxEntities > 0 ? gpGlobals->maxEntities : 0, SpawnEnt());
+	for (int k = gpGlobals->maxClients + 1; k < (int)g_spawnEnts.size(); k++)
+	{
+		edict_t* e = g_eng->pfnPEntityOfEntIndex(k);
+		if (!e || e->free || !e->pvPrivateData)
+			continue;
+		SpawnEnt& s = g_spawnEnts[k];
+		s.cls = STRING(e->v.classname);
+		s.named = e->v.targetname != 0;
+		s.monster = (e->v.flags & FL_MONSTER) && IsAlive(e);
+		s.nodraw = (e->v.effects & EF_NODRAW) != 0;
+		if (s.cls == "inter_door")
+			s.lock = DoorLock(e);
+	}
+}
+
+static void MapMemSave()
+{
+	if (g_spawnEnts.empty() || gpGlobals->maxClients <= 1)
+		return;
+	MapMem m;
+	for (int k = gpGlobals->maxClients + 1; k < (int)g_spawnEnts.size(); k++)
+	{
+		const SpawnEnt& s = g_spawnEnts[k];
+		if (s.cls.empty())
+			continue;
+		edict_t* e = g_eng->pfnPEntityOfEntIndex(k);
+		bool gone = !e || e->free || !e->pvPrivateData || s.cls != STRING(e->v.classname) || (e->v.flags & FL_KILLME) ||
+			(s.monster && !IsAlive(e)) ||
+			(!IsNull(e->v.owner) && (e->v.owner->v.flags & FL_CLIENT) && (e->v.effects & EF_NODRAW)); // item pego
+		if (gone)
+		{
+			m.gone.push_back(k);
+			continue;
+		}
+		bool nodraw = (e->v.effects & EF_NODRAW) != 0;
+		if (s.named && nodraw != s.nodraw)
+			m.nodraw.push_back({ k, nodraw });
+		if (s.cls == "inter_door" && DoorLock(e) != s.lock)
+			m.lock.push_back({ k, DoorLock(e) });
+	}
+	Log("mapa %s guardado: %d entidade(s) apagada(s), %d com visibilidade trocada, %d porta(s) com a trava trocada",
+		STRING(gpGlobals->mapname), (int)m.gone.size(), (int)m.nodraw.size(), (int)m.lock.size());
+	g_mapMem[MapKey()] = std::move(m);
+}
+
+static void MapMemRestore()
+{
+	auto it = g_mapMem.find(MapKey());
+	if (it == g_mapMem.end())
+		return;
+	const MapMem& m = it->second;
+	int n = 0;
+	auto same = [](int k, edict_t*& e) {
+		e = g_eng->pfnPEntityOfEntIndex(k);
+		return k < (int)g_spawnEnts.size() && e && !e->free && e->pvPrivateData && !g_spawnEnts[k].cls.empty() &&
+			g_spawnEnts[k].cls == STRING(e->v.classname);
+	};
+	edict_t* e;
+	for (int k : m.gone)
+		if (same(k, e))
+		{
+			e->v.flags |= FL_KILLME; // o engine libera no proximo frame; ate la nao toca nem pensa
+			e->v.solid = SOLID_NOT;
+			e->v.effects |= EF_NODRAW;
+			e->v.nextthink = 0;
+			g_eng->pfnSetOrigin(e, e->v.origin);
+			n++;
+		}
+	for (const auto& d : m.nodraw)
+		if (same(d.first, e))
+		{
+			if (d.second)
+				e->v.effects |= EF_NODRAW;
+			else
+				e->v.effects &= ~EF_NODRAW;
+		}
+	for (const auto& d : m.lock)
+		if (same(d.first, e))
+			Field<int>(e->pvPrivateData, OFS_DOOR_LOCK) = d.second.empty() ? 0 : g_eng->pfnAllocString(d.second.c_str());
+	Log("mapa %s como foi deixado: %d entidade(s) apagada(s), %d com visibilidade trocada, %d porta(s) com a trava trocada",
+		STRING(gpGlobals->mapname), n, (int)m.nodraw.size(), (int)m.lock.size());
+}
+
 // ---------------------------------------------------------------- troca de mapa
 
 // Quem estava longe de quem passou pela saida (ex.: o amigo abriu a porta e foi teleportado
@@ -1163,6 +1287,7 @@ static void DoChangeLevel(int entIndex, edict_t* anchor = NULL)
 		return;
 	const ChangeInfo& ci = it->second;
 	StopSkip("troca de mapa");
+	MapMemSave();
 	g_changing = true;
 	g_gather.active = false;
 
@@ -1216,6 +1341,10 @@ static void Cmd_Map()
 		return;
 	std::string name = map; // o Argv nao sobrevive ao resto
 	StopSkip("troca de mapa");
+	MapMemSave();
+	std::string key = name;
+	std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+	g_mapMem.erase(key); // pulo escolhido no Home: o mapa comeca do zero
 	g_changing = true;
 	g_gather.active = false;
 	g_transit.pending = true;
@@ -1437,17 +1566,101 @@ static bool HasNote(void* pl, const BYTE* note)
 	return false;
 }
 
+// Cabecalho da AddNote (depois da entrada): um documento vai com 0 0 0; um bilhete de codigo (o 'nerds' do computador
+// do c_start2) vai com 1, o numero e o tipo do codigo - mandado com zeros, a copia chegava como uma pagina em branco.
+// O hl.dll recebe o MessageBegin/WriteByte/WriteShort/MessageEnd trocados: cada AddNote que ele manda deixa aqui o
+// cabecalho daquela nota (pelo nome), para a copia ir igual.
+struct NoteHdr
+{
+	int flag, num, type;
+};
+static std::unordered_map<std::string, NoteHdr> g_noteHdr;
+static struct
+{
+	bool on;
+	edict_t* to;
+	int writes, slot;
+	NoteHdr h;
+} g_noteMsg;
+static const int OFS_KEYPAD_NUMBER = 0x2040, OFS_KEYPAD_TYPE = 0x2044; // codigo do teclado numerico de cada jogador
+
+static std::string NoteName(const BYTE* note)
+{
+	return std::string((const char*)note + 0x40, strnlen((const char*)note + 0x40, 16));
+}
+
+static void Hook_MessageBegin(int dest, int type, const float* origin, edict_t* ed)
+{
+	int msg = g_hl ? *(int*)((BYTE*)g_hl + RVA_MSG_ADDNOTE) : 0;
+	g_noteMsg.on = msg > 0 && type == msg && !IsNull(ed) && ed->pvPrivateData;
+	if (g_noteMsg.on)
+	{
+		g_noteMsg.to = ed;
+		g_noteMsg.writes = 0;
+	}
+	g_eng->pfnMessageBegin(dest, type, origin, ed);
+}
+
+static void NoteMsgWrite(int v)
+{
+	if (!g_noteMsg.on)
+		return;
+	switch (g_noteMsg.writes++)
+	{
+	case 0: g_noteMsg.slot = v; break;
+	case 1: g_noteMsg.h.flag = v; break;
+	case 2: g_noteMsg.h.num = v; break;
+	case 3: g_noteMsg.h.type = v; break;
+	}
+}
+
+static void Hook_WriteByte(int v)
+{
+	NoteMsgWrite(v);
+	g_eng->pfnWriteByte(v);
+}
+
+static void Hook_WriteShort(int v)
+{
+	NoteMsgWrite(v);
+	g_eng->pfnWriteShort(v);
+}
+
+static void Hook_MessageEnd()
+{
+	if (g_noteMsg.on && g_noteMsg.writes >= 4 && g_noteMsg.slot >= 1 && g_noteMsg.slot <= NOTE_MAX)
+	{
+		const BYTE* note = NoteAt(g_noteMsg.to->pvPrivateData, g_noteMsg.slot);
+		if (note[0x40])
+		{
+			std::string name = NoteName(note);
+			auto it = g_noteHdr.find(name);
+			if (it == g_noteHdr.end() || memcmp(&it->second, &g_noteMsg.h, sizeof(NoteHdr)))
+				Log("nota '%s': cabecalho %d %d %d", name.c_str(), g_noteMsg.h.flag, g_noteMsg.h.num, g_noteMsg.h.type);
+			g_noteHdr[name] = g_noteMsg.h;
+		}
+	}
+	g_noteMsg.on = false;
+	g_eng->pfnMessageEnd();
+}
+
 static void SendNote(edict_t* p, int n)
 {
 	int msg = *(int*)((BYTE*)g_hl + RVA_MSG_ADDNOTE);
 	if (msg <= 0)
 		return;
 	const BYTE* e = NoteAt(p->pvPrivateData, n);
+	NoteHdr h = { 0, 0, 0 };
+	auto it = g_noteHdr.find(NoteName(e));
+	if (it != g_noteHdr.end())
+		h = it->second;
+	else if (NoteName(e) == "nerds") // bilhete de codigo cujo AddNote nao vimos (veio de outra sessao)
+		h = { 1, Field<int>(p->pvPrivateData, OFS_KEYPAD_NUMBER), Field<int>(p->pvPrivateData, OFS_KEYPAD_TYPE) };
 	g_eng->pfnMessageBegin(MSG_ONE_, msg, NULL, p);
 	g_eng->pfnWriteByte(n);
-	g_eng->pfnWriteByte(0);
-	g_eng->pfnWriteShort(0);
-	g_eng->pfnWriteByte(0);
+	g_eng->pfnWriteByte(h.flag);
+	g_eng->pfnWriteShort(h.num);
+	g_eng->pfnWriteByte(h.type);
 	for (const auto& f : g_noteFields)
 	{
 		char s[0x41];
@@ -1503,6 +1716,38 @@ static void NotesThink()
 // codigo da partida, para todos e em todos os mapas.
 static const int OFS_PADLOCK_CODE = 0x235c; // int[4] (m_iPadlockNumber[1..4])
 static int g_padCode[4];
+// O codigo do teclado numerico (m_iKeypadNumber, 9999 = nenhum) e sorteado no "primeiro jogador" - quem mexeu no
+// computador - e e ele que o teclado confere: o mesmo para todos, como o do cadeado.
+static const int KEYPAD_NONE = 9999;
+static int g_keypad[2], g_keypadSeen[33];
+
+static void KeypadSync()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT))
+			continue;
+		int& num = Field<int>(p->pvPrivateData, OFS_KEYPAD_NUMBER);
+		if (num != g_keypadSeen[i] && num && num != KEYPAD_NONE && num != g_keypad[0]) // o jogo sorteou um novo
+		{
+			g_keypad[0] = num;
+			g_keypad[1] = Field<int>(p->pvPrivateData, OFS_KEYPAD_TYPE);
+			Log("codigo do teclado: %d (tipo %d, do jogador %d)", g_keypad[0], g_keypad[1], i);
+		}
+		g_keypadSeen[i] = num;
+	}
+	if (!g_keypad[0])
+		return;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT) || Field<int>(p->pvPrivateData, OFS_KEYPAD_NUMBER) == g_keypad[0])
+			continue;
+		Field<int>(p->pvPrivateData, OFS_KEYPAD_NUMBER) = g_keypadSeen[i] = g_keypad[0];
+		Field<int>(p->pvPrivateData, OFS_KEYPAD_TYPE) = g_keypad[1];
+	}
+}
 
 static void PadCodeThink()
 {
@@ -1510,6 +1755,7 @@ static void PadCodeThink()
 	if (gpGlobals->time < next && next - gpGlobals->time < 1.0f)
 		return;
 	next = gpGlobals->time + 0.5f;
+	KeypadSync();
 	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
 	{
 		edict_t* p = PlayerAt(i);
@@ -1535,6 +1781,30 @@ static void PadCodeThink()
 static void ResetPadCode()
 {
 	memset(g_padCode, 0, sizeof(g_padCode));
+	memset(g_keypad, 0, sizeof(g_keypad));
+	memset(g_keypadSeen, 0, sizeof(g_keypadSeen));
+	g_noteHdr.clear();
+}
+
+// Com o codigo certo o item_padlock agenda o fim (2 s depois: dispara o alvo, devolve a visao e o controle) para o
+// "primeiro jogador". Fora de um comando nao ha jogador atual, entao era sempre o host: o convidado que abriu o
+// cadeado ficava preso na camera dele. Guardamos quem girou cada cadeado e o think dele roda como esse jogador.
+static const int OFS_PADLOCK = 0x2350; // EHANDLE m_pPadlock (edict_t*, serial)
+static std::unordered_map<int, std::pair<int, edict_t*>> g_padUser; // indice do cadeado -> (serial, jogador)
+
+static void NotePadlockUser(edict_t* p)
+{
+	edict_t* pad = Field<edict_t*>(p->pvPrivateData, OFS_PADLOCK);
+	if (!IsNull(pad) && pad->serialnumber == Field<int>(p->pvPrivateData, OFS_PADLOCK + 4))
+		g_padUser[g_eng->pfnIndexOfEdict(pad)] = { pad->serialnumber, p };
+}
+
+static edict_t* PadlockUser(edict_t* pad)
+{
+	auto it = g_padUser.find(g_eng->pfnIndexOfEdict(pad));
+	if (it == g_padUser.end() || it->second.first != pad->serialnumber || !IsPlayer(it->second.second))
+		return NULL;
+	return it->second.second;
 }
 
 // inventorydualwield: o ClientCommand do hl.dll ignora no MP; chamamos o metodo do jogador direto
@@ -2929,7 +3199,10 @@ static void Hook_Think(edict_t* ent)
 		ent->v.nextthink = gpGlobals->time + 0.1f;
 		return;
 	}
-	g_orig.pfnThink(ent);
+	{
+		ActorScope actor(!IsNull(ent) && !strcmp(STRING(ent->v.classname), "item_padlock") ? PadlockUser(ent) : NULL);
+		g_orig.pfnThink(ent);
+	}
 	if (g_tracing)
 	{
 		char during[128];
@@ -3034,7 +3307,14 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	bool fromMenu = g_lastMap.empty() || !_strnicmp(g_lastMap.c_str(), "c_game_menu", 11);
 	ResetAdmin(fromMenu);
 	if (fromMenu)
+	{
 		ResetPadCode(); // partida nova ou save carregado: vale o codigo do jogador de agora
+		g_mapMem.clear();
+	}
+	g_padUser.clear();
+	MapMemSnapshot();
+	if (arrived && !g_transit.landmark.empty())
+		MapMemRestore();
 	ResetMenu();
 	g_lastMap = map;
 	ResetRespawn();
@@ -3405,6 +3685,8 @@ static void Hook_ClientCommand(edict_t* e)
 	}
 	if (!drop)
 	{
+		if (i > 0 && i < 33 && e->pvPrivateData) // antes: o codigo certo zera o m_pPadlock de quem girou
+			NotePadlockUser(e);
 		g_orig.pfnClientCommand(e);
 		if (i > 0 && i < 33 && !strcmp(name, "flashlight"))
 			FlashLog(e);
@@ -5056,6 +5338,10 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	g_engForHL.pfnCreateNamedEntity = Hook_CreateNamedEntity;
 	g_engForHL.pfnRemoveEntity = Hook_RemoveEntity;
 	g_engForHL.pfnFindEntityByString = Hook_FindEntityByString;
+	g_engForHL.pfnMessageBegin = Hook_MessageBegin;
+	g_engForHL.pfnMessageEnd = Hook_MessageEnd;
+	g_engForHL.pfnWriteByte = Hook_WriteByte;
+	g_engForHL.pfnWriteShort = Hook_WriteShort;
 	typedef void(__stdcall * fn_t)(enginefuncs_t*, globalvars_t*);
 	((fn_t)GetProcAddress(g_hl, "GiveFnptrsToDll"))(&g_engForHL, globals);
 }

@@ -95,9 +95,20 @@ static bool IsNull(edict_t* e)
 	return !e || e->free || g_eng->pfnIndexOfEdict(e) == 0;
 }
 
+// Cliente conectado de fato (ClientConnect aceito, ainda sem ClientDisconnect). Ao carregar um save os corpos dos
+// jogadores voltam do arquivo antes de alguem conectar: mandar mensagem a eles escrevia num cliente vazio e o
+// engine fechava o jogo ("SZ_GetSpace: Tried to write to an uninitialized sizebuf_t: ???").
+static bool g_conn[33];
+
+static bool IsConnected(edict_t* e)
+{
+	int i = g_eng->pfnIndexOfEdict(e);
+	return i > 0 && i < 33 && g_conn[i];
+}
+
 static bool IsPlayer(edict_t* e)
 {
-	return !IsNull(e) && (e->v.flags & FL_CLIENT) && e->pvPrivateData && e->v.iuser1 == 0;
+	return !IsNull(e) && (e->v.flags & FL_CLIENT) && e->pvPrivateData && e->v.iuser1 == 0 && IsConnected(e);
 }
 
 static bool IsAlive(edict_t* e)
@@ -1003,6 +1014,7 @@ static bool g_aliveLast[33];
 static Vector g_deathPos[33];
 static float g_nextSnap;
 static std::string g_lastMap; // para reconhecer o reinicio do mesmo mapa
+static bool g_loadAsked; // Home > Carregar mandou "load coop_...": o proximo mapa vem do save, nao e reinicio
 
 static void SnapshotThink()
 {
@@ -2161,6 +2173,9 @@ static void Cmd_Bot()
 	}
 	char reject[128];
 	g_orig.pfnClientConnect(b, name, "127.0.0.1", reject);
+	int k = g_eng->pfnIndexOfEdict(b);
+	if (k > 0 && k < 33)
+		g_conn[k] = true;
 	g_orig.pfnClientPutInServer(b);
 	b->v.flags |= FL_FAKECLIENT;
 	Log("bot '%s' entrou no slot %d", name, g_eng->pfnIndexOfEdict(b));
@@ -2625,7 +2640,7 @@ static bool g_specFix[33]; // espectava quando o mapa trocou: o corpo veio na tr
 static edict_t* ClientAt(int i) // como PlayerAt, mas vale tambem para quem esta espectando
 {
 	edict_t* e = g_eng->pfnPEntityOfEntIndex(i);
-	return !IsNull(e) && (e->v.flags & FL_CLIENT) && e->pvPrivateData ? e : NULL;
+	return !IsNull(e) && (e->v.flags & FL_CLIENT) && e->pvPrivateData && IsConnected(e) ? e : NULL;
 }
 
 static void ShowBody(int i, edict_t* p)
@@ -3344,10 +3359,14 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	FindCutsceneTriggers();
 
 	const char* map = STRING(gpGlobals->mapname);
-	bool arrived = g_transit.pending && !_stricmp(map, g_transit.map.c_str());
+	bool loaded = g_loadAsked && _strnicmp(map, "c_game_menu", 11);
+	if (loaded)
+		g_loadAsked = false;
+	bool arrived = !loaded && g_transit.pending && !_stricmp(map, g_transit.map.c_str());
 	// mesmo mapa de novo sem changelevel nosso = todos morreram: volta ao checkpoint
-	bool restart = !arrived && !_stricmp(map, g_lastMap.c_str());
-	bool fromMenu = g_lastMap.empty() || !_strnicmp(g_lastMap.c_str(), "c_game_menu", 11);
+	bool restart = !arrived && !loaded && !_stricmp(map, g_lastMap.c_str());
+	// save carregado: como uma partida nova (os inventarios vem do arquivo)
+	bool fromMenu = loaded || g_lastMap.empty() || !_strnicmp(g_lastMap.c_str(), "c_game_menu", 11);
 	ResetAdmin(fromMenu);
 	if (fromMenu)
 	{
@@ -3405,9 +3424,9 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 		g_eng->pfnServerCommand(cmd);
 	}
 
-	Log("mapa %s: %d trigger_changelevel, %d gatilho(s) de cutscene%s%s", map, (int)g_changelevels.size(),
+	Log("mapa %s: %d trigger_changelevel, %d gatilho(s) de cutscene%s%s%s", map, (int)g_changelevels.size(),
 		(int)g_cutTrig.size(), g_arrive.active ? ", posicionando jogadores pelo landmark" : "",
-		restart ? ", reinicio: devolvendo inventarios do checkpoint" : "");
+		restart ? ", reinicio: devolvendo inventarios do checkpoint" : "", loaded ? ", partida carregada do save" : "");
 }
 
 static void ArriveThink()
@@ -3654,6 +3673,9 @@ static void Hook_ClientPutInServer(edict_t* e)
 static qboolean Hook_ClientConnect(edict_t* e, const char* name, const char* addr, char reject[128])
 {
 	qboolean ok = g_orig.pfnClientConnect(e, name, addr, reject);
+	int i = g_eng->pfnIndexOfEdict(e);
+	if (i > 0 && i < 33)
+		g_conn[i] = ok != 0;
 	Log("conexao do jogador %d '%s' (%s)%s%s", g_eng->pfnIndexOfEdict(e), name, addr, ok ? "" : " recusada: ",
 		ok ? "" : reject);
 	return ok;
@@ -3720,6 +3742,16 @@ static void Hook_ClientCommand(edict_t* e)
 	ActorScope actor(e);
 	// Atalhos numericos: dois atalhos apertados em 0.25 s viram dual wield. O jogo faz isso no quicksel, mas so fora
 	// do multiplayer (pergunta a regra antes); aqui as duas armas dos atalhos vao pelo mesmo caminho do inventario.
+	// O quickselsetN k grava no atalho N a classe lida do arquivo do item k; guardamos tambem o arquivo do item
+	// (inventorySlot), que acha o item mesmo se ele mudar de lugar no inventario.
+	static std::string quickItem[33][3];
+	if (i > 0 && i < 33 && e->pvPrivateData && !strncmp(name, "quickselset", 11) && name[11] >= '1' &&
+		name[11] <= '3' && !name[12])
+	{
+		int k = atoi(g_eng->pfnCmd_Argv(1));
+		quickItem[i][name[11] - '1'] = k >= 0 && k < 7 ? StrOrEmpty(Field<int>(e->pvPrivateData, OFS_INV_SLOT + k * 4))
+			: std::string();
+	}
 	if (i > 0 && i < 33 && g_DualWield && e->pvPrivateData && cv_enable.value && gpGlobals->maxClients > 1 &&
 		!strcmp(name, "quicksel") && IsAlive(e))
 	{
@@ -3732,12 +3764,16 @@ static void Hook_ClientCommand(edict_t* e)
 		if (both)
 		{
 			void* pl = e->pvPrivateData;
-			auto slotOf = [pl](int quick) {
+			auto slotOf = [pl, i](int quick) {
+				const std::string& item = quickItem[i][quick - 1];
+				for (int k = 0; k < 7 && !item.empty(); k++)
+					if (!_stricmp(StrOrEmpty(Field<int>(pl, OFS_INV_SLOT + k * 4)).c_str(), item.c_str()))
+						return k;
 				const char* cls = (const char*)pl + OFS_QUICK_SLOT + (quick - 1) * QUICK_SLOT_LEN;
 				for (int k = 0; k < 7 && cls[0]; k++)
 				{
 					int s = Field<int>(pl, OFS_INV_CLASS + k * 4);
-					if (s && !strcmp(STRING(s), cls))
+					if (s && !_stricmp(STRING(s), cls))
 						return k;
 				}
 				return -1;
@@ -3751,6 +3787,15 @@ static void Hook_ClientCommand(edict_t* e)
 				last[i] = 0;
 				return;
 			}
+			std::string inv;
+			for (int k = 0; k < 7; k++)
+				inv += " " + StrOrEmpty(Field<int>(pl, OFS_INV_SLOT + k * 4)) + "=" +
+					StrOrEmpty(Field<int>(pl, OFS_INV_CLASS + k * 4));
+			Log("jogador %d: atalhos %d e %d juntos, mas sem dual (inventario %d e %d): atalho %d '%.40s' (%s), "
+				"atalho %d '%.40s' (%s); inventario:%s", i, prev, n, b, a,
+				prev, (const char*)pl + OFS_QUICK_SLOT + (prev - 1) * QUICK_SLOT_LEN, quickItem[i][prev - 1].c_str(),
+				n, (const char*)pl + OFS_QUICK_SLOT + (n - 1) * QUICK_SLOT_LEN, quickItem[i][n - 1].c_str(),
+				inv.c_str());
 		}
 	}
 	if (i > 0 && i < 33 && g_DualWield && e->pvPrivateData && cv_enable.value && gpGlobals->maxClients > 1 &&
@@ -3825,6 +3870,8 @@ static void Hook_ClientDisconnect(edict_t* e)
 		Log("jogador %d desconectou (foto do inventario %s)", i, g_inv[i].valid ? "mantida" : "vazia");
 	}
 	g_orig.pfnClientDisconnect(e);
+	if (i > 0 && i < 33)
+		g_conn[i] = false;
 }
 
 // ---------------------------------------------------------------- exports
@@ -5398,6 +5445,8 @@ static void WatchStart()
 
 static void HudCommand(const char* cmd)
 {
+	if (strstr(cmd, "\nload "))
+		g_loadAsked = true;
 	g_eng->pfnServerCommand((char*)cmd);
 }
 

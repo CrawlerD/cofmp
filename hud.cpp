@@ -534,7 +534,8 @@ static void CoopPanelThink()
 		FlushInstructionCache(GetCurrentProcess(), push, 5);
 		patched = true;
 	}
-	if (!patched)
+	// ao fechar o jogo o client.dll sai da memoria antes de nos: ler a tabela dele derrubava o jogo
+	if (!patched || GetModuleHandleA("client.dll") != (HMODULE)base)
 		return;
 	typedef int (*GetMaxClients_t)();
 	GetMaxClients_t maxClients = *(GetMaxClients_t*)(base + RVA_GETMAXCLIENTS);

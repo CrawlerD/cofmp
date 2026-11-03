@@ -98,6 +98,8 @@ Com o mod instalado, aperte **Home** em qualquer momento do jogo (menu ou partid
 
 **Painel nativo do co-op (v1.5):** o `client.dll` só desenha o painel "Nome - Health N - Ping N" com o ícone da seringa nos mapas `cof_*`. Em multiplayer, a DLL troca a string comparada por uma vazia, então o painel aparece também nos mapas da campanha (`c_*`).
 
+**FPS acima de 100:** o `Host_FilterTime` do `hw.dll` corta o fps em 100 quando `developer` é 0, mesmo com `fps_max 111` no `config.cfg` (o valor que o CoF grava). O mod troca o teste do `developer` por um salto, então o `fps_max` volta a valer e o jogo passa dos 100. O limite continua sendo o `fps_max` (72 por padrão); para trocar em jogo, use `cofmp_fps <n>` no console do host. Se o `hw.dll` não for a versão esperada, o patch se desliga sozinho e o jogo fica como antes.
+
 Como funciona por dentro:
 - A janela é Win32 e roda numa thread do `cofmp.dll`, que o engine carrega no processo do jogo já no menu (`hud.cpp`).
 - Os comandos entram numa fila. Quem a esvazia na thread principal é a janela do jogo, que é subclassificada (`WM_HUD_CMD`), e também o `StartFrame`.
@@ -149,6 +151,7 @@ Apague o `teste.txt` depois do teste, senão ele roda em toda partida.
 | `cofmp_go` | solta a espera do começo do mapa ou da cutscene sem aguardar os outros (Home > Começar agora) |
 | `cofmp_map <mapa>` | troca o servidor para outro mapa levando o inventário (Home > Trocar mapa) |
 | `cofmp_skip` | pula a cutscene atual, como o Enter do single player (o Enter manda isso no co-op) |
+| `cofmp_fps [n]` | mostra o `fps_max`; com `n`, troca o limite (o teto de 100 do engine já é removido ao carregar) |
 | `cofmp_debug` | estado dos slots de jogador |
 | `cofmp_inv` | chaveiro do grupo, armas, munição e slots de inventário de cada jogador |
 | `cofmp_bot [nome]` | cria um bot parado (testes com 1 pessoa só) |
@@ -170,3 +173,4 @@ Apague o `teste.txt` depois do teste, senão ele roda em toda partida.
 - Bots (`FL_FAKECLIENT`) não têm canal de rede. Na troca de mapa o engine os derruba, e um `SetView` neles dá "SZ_GetSpace: Tried to write to an uninitialized sizebuf_t". Por isso a câmera de cutscene não é compartilhada com bots nem durante a troca.
 - Revive nativo: `CBasePlayer::StartRevive` (RVA 0xf1860, `thiscall`, sem argumentos). Ele é chamado pela seringa quando ela acerta um jogador morto e o modo é co-op. Também é chamado quando alguém segura USE perto do corpo. A função põe `pev->fuser3 = 3`, e o think de morte (0x100e9ab0) levanta o jogador com 30 de vida quando o tempo acaba.
 - Estamina (achado pelo Riique): no `CBasePlayer`, `m_bInfiniteStamina` fica em 0x21e8 e `m_fStamina` em 0x21f0 (tabela de save/restore, `g_PlayerSaveFields`). Com o bool ligado o `PreThink` não gasta estamina ao correr; `m_fStamina` é o valor que vai para a barra do HUD no user message `Stamina`.
+- FPS: o `Host_FilterTime` do `hw.dll` lê o `fps_max` e, se `developer` for 0, corta o valor em 100. O `je` desse teste fica no RVA 0x7eb25 (`74 2C` → `EB 2C`, conferido por assinatura). O `fps_max` continua valendo; o patch só remove o teto de 100.

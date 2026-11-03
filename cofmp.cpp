@@ -1497,6 +1497,46 @@ static void NotesThink()
 	}
 }
 
+// Codigo do cadeado: cada jogador sorteia o seu ao nascer (m_iPadlockNumber, 4 digitos de 1 a 9) e o item_padlock
+// copia o de quem o usa. No MP cada um tinha um codigo, e cada troca de mapa sorteava outro (o jogador nao vem do
+// save da transicao) - a nota com o codigo, copiada do host, nao abria o cadeado de ninguem. Vale o primeiro
+// codigo da partida, para todos e em todos os mapas.
+static const int OFS_PADLOCK_CODE = 0x235c; // int[4] (m_iPadlockNumber[1..4])
+static int g_padCode[4];
+
+static void PadCodeThink()
+{
+	static float next;
+	if (gpGlobals->time < next && next - gpGlobals->time < 1.0f)
+		return;
+	next = gpGlobals->time + 0.5f;
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT))
+			continue;
+		int* code = &Field<int>(p->pvPrivateData, OFS_PADLOCK_CODE);
+		if (!code[0] || !code[1] || !code[2] || !code[3]) // ainda nao sorteou
+			continue;
+		if (!g_padCode[0])
+		{
+			memcpy(g_padCode, code, sizeof(g_padCode));
+			Log("codigo do cadeado da partida: %d%d%d%d (do jogador %d)", code[0], code[1], code[2], code[3], i);
+		}
+		else if (memcmp(code, g_padCode, sizeof(g_padCode)))
+		{
+			Log("jogador %d: codigo do cadeado %d%d%d%d -> %d%d%d%d", i, code[0], code[1], code[2], code[3],
+				g_padCode[0], g_padCode[1], g_padCode[2], g_padCode[3]);
+			memcpy(code, g_padCode, sizeof(g_padCode));
+		}
+	}
+}
+
+static void ResetPadCode()
+{
+	memset(g_padCode, 0, sizeof(g_padCode));
+}
+
 // inventorydualwield: o ClientCommand do hl.dll ignora no MP; chamamos o metodo do jogador direto
 typedef void(__thiscall* DualWield_t)(void* player, int a, int b);
 static DualWield_t g_DualWield;
@@ -2016,6 +2056,87 @@ static void StartHold(bool fresh)
 static void Hook_Touch(edict_t* touched, edict_t* other);
 static bool IsTriggerEnt(edict_t* e);
 
+// ---------------------------------------------------------------- saida de volta embaixo de quem chegou
+//
+// No c_start/c_start2 o landmark fica dentro das duas saidas (a de ida e a de volta). No SP o jogador chega no
+// mesmo ponto e fora do gatilho de volta; no MP quem chega e empurrado para um lugar livre e pode cair dentro dele:
+// o mapa trocava de volta na hora e os dois ficavam num loop de loading. Quem chega pelo landmark dentro de um
+// gatilho que troca de mapa so dispara esse gatilho depois de sair dele.
+static std::vector<int> g_exitGuard[33];
+
+static bool LeadsToChange(edict_t* trig)
+{
+	if (IsNull(trig) || trig->v.solid != SOLID_TRIGGER)
+		return false;
+	int idx = g_eng->pfnIndexOfEdict(trig);
+	if (g_changelevels.count(idx))
+		return true;
+	const char* target = trig->v.target ? STRING(trig->v.target) : "";
+	if (!*target)
+		return false;
+	for (auto& kv : g_changelevels)
+	{
+		edict_t* cl = g_eng->pfnPEntityOfEntIndex(kv.first);
+		if (!IsNull(cl) && cl->v.targetname && !strcmp(STRING(cl->v.targetname), target))
+			return true;
+	}
+	return false;
+}
+
+static void GuardExits(int i, edict_t* p)
+{
+	g_exitGuard[i].clear();
+	for (int k = gpGlobals->maxClients + 1; k < gpGlobals->maxEntities; k++)
+	{
+		edict_t* t = g_eng->pfnPEntityOfEntIndex(k);
+		if (IsNull(t) || t->v.solid != SOLID_TRIGGER || !Overlaps(p, t) || !LeadsToChange(t))
+			continue;
+		g_exitGuard[i].push_back(k);
+		Log("jogador %d chegou dentro da saida #%d '%s': ela so vale depois que ele sair dela", i, k,
+			STRING(t->v.classname));
+	}
+}
+
+static bool ExitGuarded(edict_t* trig, edict_t* other)
+{
+	if (IsNull(trig) || !IsPlayer(other))
+		return false;
+	int i = g_eng->pfnIndexOfEdict(other);
+	if (i < 1 || i >= 33 || g_exitGuard[i].empty())
+		return false;
+	int t = g_eng->pfnIndexOfEdict(trig);
+	return std::find(g_exitGuard[i].begin(), g_exitGuard[i].end(), t) != g_exitGuard[i].end();
+}
+
+static void ExitGuardThink()
+{
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		auto& v = g_exitGuard[i];
+		if (v.empty())
+			continue;
+		edict_t* p = PlayerAt(i);
+		for (size_t n = 0; n < v.size();)
+		{
+			edict_t* t = g_eng->pfnPEntityOfEntIndex(v[n]);
+			if (p && IsAlive(p) && !IsNull(t) && Overlaps(p, t))
+			{
+				n++;
+				continue;
+			}
+			if (p)
+				Log("jogador %d saiu da saida #%d", i, v[n]);
+			v.erase(v.begin() + n);
+		}
+	}
+}
+
+static void ResetExitGuard(int i)
+{
+	if (i >= 0 && i < 33)
+		g_exitGuard[i].clear();
+}
+
 // Quem nasce dentro de um gatilho (o trigger_once da abertura do c_intro fica em volta do info_player_start) so o
 // toca no primeiro frame, quando ainda estamos segurando; parado, o engine nao manda o toque de novo. Ao soltar,
 // toca de novo os gatilhos segurados com quem ainda esta dentro deles.
@@ -2039,7 +2160,8 @@ static void ReleaseHold(const char* why)
 		{
 			edict_t* trig = g_eng->pfnPEntityOfEntIndex(idx);
 			edict_t* o = PlayerAt(k);
-			if (IsNull(trig) || !IsTriggerEnt(trig) || trig->v.solid != SOLID_TRIGGER || !o || !IsAlive(o) || !Overlaps(o, trig))
+			if (IsNull(trig) || !IsTriggerEnt(trig) || trig->v.solid != SOLID_TRIGGER || !o || !IsAlive(o) || !Overlaps(o, trig) ||
+				ExitGuarded(trig, o))
 				continue;
 			Log("gatilho #%d '%s' tocado de novo por '%s' (estava dentro dele na espera)", idx, STRING(trig->v.classname),
 				STRING(o->v.netname));
@@ -2782,6 +2904,8 @@ static void Hook_Touch(edict_t* touched, edict_t* other)
 			g_hold.held.push_back(t);
 		return;
 	}
+	if (ExitGuarded(touched, other) || ExitGuarded(other, touched))
+		return;
 	if (!IsNull(touched) && !IsNull(other) && CutWaitTouch(touched, other))
 		return;
 	if (PickupTouch(touched, other))
@@ -2909,6 +3033,8 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 	bool restart = !arrived && !_stricmp(map, g_lastMap.c_str());
 	bool fromMenu = g_lastMap.empty() || !_strnicmp(g_lastMap.c_str(), "c_game_menu", 11);
 	ResetAdmin(fromMenu);
+	if (fromMenu)
+		ResetPadCode(); // partida nova ou save carregado: vale o codigo do jogador de agora
 	ResetMenu();
 	g_lastMap = map;
 	ResetRespawn();
@@ -3009,6 +3135,7 @@ static void ArriveThink()
 		}
 		else
 			Log("jogador %d: sem espaco livre perto do landmark, mantendo spawn", i);
+		GuardExits(i, p);
 		g_arrive.place[i] = false;
 		g_unstickAt[i] = gpGlobals->time + 0.2f;
 	}
@@ -3048,6 +3175,7 @@ static void TraceThink();
 static void InvWatchThink();
 static void FloorWatchThink();
 static void ViewFixThink();
+static void RenderWatchThink();
 static void FlashLog(edict_t* e);
 static void ResetFloor();
 static void TestScriptThink();
@@ -3120,6 +3248,7 @@ static void Hook_StartFrame()
 	InvWatchThink();
 	FloorWatchThink();
 	ViewFixThink();
+	RenderWatchThink();
 	BotThink();
 	HoldThink();
 	CutWaitThink();
@@ -3128,6 +3257,7 @@ static void Hook_StartFrame()
 	CamJoinThink();
 	GatherThink();
 	ArriveThink();
+	ExitGuardThink();
 	UnstickThink();
 	RestoreThink();
 	ShareThink();
@@ -3138,6 +3268,7 @@ static void Hook_StartFrame()
 	SnapshotThink();
 	ObjectiveThink();
 	NotesThink();
+	PadCodeThink();
 }
 
 // ---------------------------------------------------------------- modelo do jogador
@@ -3267,6 +3398,9 @@ static void Hook_ClientCommand(edict_t* e)
 		!strcmp(name, "inventorydualwield"))
 	{
 		g_DualWield(e->pvPrivateData, atoi(g_eng->pfnCmd_Argv(1)), atoi(g_eng->pfnCmd_Argv(2)));
+		// o jogo cria a weapon_dualweapon e a entrega por toque; no SP a regra troca para ela, a do MP nao - ela
+		// ficava na lista de armas sem slot no inventario para ser escolhida
+		SelectWeapon(i, e, "weapon_dualweapon");
 		return;
 	}
 	if (!drop)
@@ -3313,6 +3447,7 @@ static void Hook_ClientDisconnect(edict_t* e)
 		if (g_camOwner == i)
 			Hook_SetView(e, e); // devolve a visao dos outros
 		g_ownView[i] = NULL;
+		ResetExitGuard(i);
 		g_hold.frozen[i] = false;
 		g_cut.waiting[i] = false;
 		g_cut.frozen[i] = false;
@@ -3476,7 +3611,9 @@ static void ResetCutscene()
 // pula o host_framerate; com ele trocado por nop, vale tambem no MP.
 static const DWORD RVA_FILTER_SP_CHECK = 0x7ea3a;
 static const char SIG_FILTER_SP_CHECK[] = "\x85\xC0\x75\x09\x83\x3D????\x00\x74\x2E"; // ? = endereco de cls
-static const float SKIP_FRAMERATE = 2.0f; // o valor que o client.dll usa no SP
+// O client.dll do host zera host_framerate a cada frame se ele vale exatamente 2 e nao ha camera (client.dll
+// 0x10072b22): o pulo sem camera nao acelerava nada. 1.99 escapa dessa checagem e anda quase o mesmo.
+static const float SKIP_FRAMERATE = 1.99f;
 static const int SF_CAMERA_NOSKIP = 0x400;
 static bool g_skipping;
 // Depois da ultima camera o mapa ainda pode seguir sozinho (fade, falas, relays com delay) ate trocar de mapa: no
@@ -4095,6 +4232,47 @@ static void ViewFixThink()
 		Log("jogador %d: visao presa na entidade #%d ('%s'), o que esconde a lanterna dele; devolvendo", i, view,
 			v && !v->free ? STRING(v->v.classname) : "");
 		view = i; // o hl.dll reenvia o ViewEntity no proximo UpdateClientData
+	}
+}
+
+// Corpo dos jogadores: os mapas do SP escondem "o jogador" (EF_NODRAW, renderamt 0) em cenas e portas e so
+// devolvem para quem acharam. Toda mudanca vai ao log; fora de camera, quem esta vivo e nao espectando e
+// fica escondido por 1 s volta a aparecer (antes so voltava ao morrer e renascer).
+static void RenderWatchThink()
+{
+	static int last[33][4];
+	static float hiddenSince[33];
+	for (int i = 1; i <= gpGlobals->maxClients && i < 33; i++)
+	{
+		edict_t* p = PlayerAt(i);
+		if (!p || (p->v.flags & FL_FAKECLIENT) || !IsAlive(p) || g_spec[i].target)
+		{
+			hiddenSince[i] = 0;
+			continue;
+		}
+		int now[4] = { p->v.effects & EF_NODRAW, p->v.rendermode, (int)p->v.renderamt, p->v.renderfx };
+		if (memcmp(now, last[i], sizeof(now)))
+		{
+			Log("jogador %d: corpo effects %d, rendermode %d, renderamt %d, renderfx %d, modelo #%d", i,
+				p->v.effects, now[1], now[2], now[3], p->v.modelindex);
+			memcpy(last[i], now, sizeof(now));
+		}
+		bool hidden = now[0] || (now[1] != kRenderNormal && now[2] < 30);
+		if (!hidden || g_camOwner)
+		{
+			hiddenSince[i] = 0;
+			continue;
+		}
+		if (!hiddenSince[i])
+			hiddenSince[i] = gpGlobals->time;
+		if (gpGlobals->time - hiddenSince[i] < 1.0f && gpGlobals->time >= hiddenSince[i])
+			continue;
+		Log("jogador %d: corpo escondido fora de cena; mostrando de novo", i);
+		p->v.effects &= ~EF_NODRAW;
+		p->v.rendermode = kRenderNormal;
+		p->v.renderamt = 255;
+		p->v.renderfx = kRenderFxNone;
+		hiddenSince[i] = 0;
 	}
 }
 

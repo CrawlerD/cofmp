@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: SDK do Half-Life
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/ValveSoftware/halflife deps/halflife
+          "HL_SDK=$env:GITHUB_WORKSPACE\deps\halflife" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build (DLL, instalador e tunel)
+        shell: cmd
+        run: |
+          call build.bat || exit /b 1
+          call installer\build_installer.bat || exit /b 1
+          call tunnel\build_tunnel.bat || exit /b 1
+
+      - name: Testes do instalador
+        shell: pwsh
+        run: |
+          .\dist\CoF_Coop_Mod.exe --selftest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\tools\test_installer.ps1 -Exe .\dist\CoF_Coop_Mod.exe
+
+      - name: Build reproduzivel (compara os hashes)
+        shell: pwsh
+        run: |
+          $files = @("build\cofmp.dll", "dist\CoF_Coop_Mod.exe", "dist\CoF_Tunel.exe")
+          $before = @{}
+          foreach ($f in $files) { $before[$f] = (Get-FileHash $f -Algorithm SHA256).Hash }
+          Remove-Item -Recurse -Force build
+          Remove-Item -Force dist\CoF_Coop_Mod.exe, dist\CoF_Tunel.exe -ErrorAction SilentlyContinue
+          cmd /c "call build.bat && call installer\build_installer.bat && call tunnel\build_tunnel.bat"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($f in $files) {
+            $after = (Get-FileHash $f -Algorithm SHA256).Hash
+            if ($before[$f] -ne $after) {
+              Write-Error "build nao reproduzivel: $f ($($before[$f]) != $after)"
+              exit 1
+            }
+            Write-Host "reproduzivel: $f $after"
+          }
+
+      - name: Artefatos
+        uses: actions/upload-artifact@v4
+        with:
+          name: cofmp
+          path: |
+            build/cofmp.dll
+            dist/CoF_Coop_Mod.exe
+            dist/CoF_Tunel.exe

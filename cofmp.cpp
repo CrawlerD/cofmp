@@ -4647,7 +4647,29 @@ static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* ep)
 	// MiniDumpWithDataSegs (1) | MiniDumpWithIndirectlyReferencedMemory (0x40): globais dos modulos e o que a pilha aponta
 	write(GetCurrentProcess(), GetCurrentProcessId(), f, 0x41, &info, NULL, NULL);
 	CloseHandle(f);
+	// no log tambem: sem esta linha um crash e um jogo fechado de proposito deixavam o log igual
+	char where[MAX_PATH] = "?";
+	HMODULE mod = NULL;
+	void* at = ep->ExceptionRecord->ExceptionAddress;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)at, &mod) && GetModuleFileNameA(mod, where, sizeof(where)))
+	{
+		const char* base = strrchr(where, '\\');
+		memmove(where, base ? base + 1 : where, strlen(base ? base + 1 : where) + 1);
+	}
+	char line[MAX_PATH * 2];
+	_snprintf(line, sizeof(line), "---- erro fatal 0x%08lX em %s+%lx (o jogo provavelmente vai fechar); dump em %s", code, where,
+		(unsigned long)((BYTE*)at - (BYTE*)mod), path);
+	line[sizeof(line) - 1] = 0;
+	LogFile_Write("jogo", line);
 	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Roda quando o processo termina pelo caminho normal (sair pelo menu, quit, fechar a janela). Um crash ou o jogo
+// morto pelo Gerenciador de Tarefas nao passa por aqui - entao o log sem esta linha no fim = o jogo caiu.
+static void LogGameClosed()
+{
+	LogFile_Write("jogo", "---- jogo fechado normalmente");
 }
 
 // ---------------------------------------------------------------- vigia de travamento
@@ -5321,6 +5343,7 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 		g_modDir = dir;
 		LogFile_Open(dir);
 		LogFile_Write("jogo", "---- cofmp v" COFMP_VERSION " carregado");
+		atexit(LogGameClosed);
 		WatchStart();
 	}
 	Hud_Start(HudCommand);

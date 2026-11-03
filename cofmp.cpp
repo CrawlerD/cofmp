@@ -243,6 +243,8 @@ enum
 	OFS_INV_SLOT = 0x21fc,     // string_t inventorySlot[7]
 	OFS_INV_MODEL = 0x2218,    // string_t inventorySlotModels[7]
 	OFS_INV_CLASS = 0x2234,    // string_t inventorySlotClassname[7]
+	OFS_QUICK_SLOT = 0x204c,   // char[128] x 3: classe da arma de cada atalho numerico (quickselset1..3)
+	QUICK_SLOT_LEN = 0x80,
 	OFS_FLASH_BATTERY = 0x22a8,
 	OFS_FLASH_FLAGS = 0x5d0,  // lanterna ligada (mandado ao cliente pela mensagem FlashFlags)
 	OFS_VIEW_ENTITY = 0x2038, // indice da entidade pela qual o jogador olha (mensagem ViewEntity)
@@ -1159,6 +1161,18 @@ static void ResetRespawn()
 // killtarget, itens pegos), monstros mortos, o que ficou visivel ou invisivel e a trava das inter_door - e, voltando
 // pelo landmark, reaplicamos. O mapa nasce sempre na mesma ordem, entao o indice da entidade (com a classe conferida)
 // identifica a mesma coisa entre uma visita e outra.
+// Entidades desligadas pela memoria do mapa (ver MapMemRestore): continuam alocadas, mas ninguem as acha, toca ou
+// faz pensar. indice -> serial + 1 (0 = nao desligada).
+static std::vector<int> g_neutral;
+
+static bool IsNeutral(edict_t* e)
+{
+	if (IsNull(e) || e->free)
+		return false;
+	int k = g_eng->pfnIndexOfEdict(e);
+	return k > 0 && k < (int)g_neutral.size() && g_neutral[k] == e->serialnumber + 1;
+}
+
 static const int OFS_DOOR_LOCK = 0x190; // inter_door: string_t de quem a tranca (0 = destrancada)
 
 struct SpawnEnt
@@ -1252,10 +1266,19 @@ static void MapMemRestore()
 	for (int k : m.gone)
 		if (same(k, e))
 		{
-			e->v.flags |= FL_KILLME; // o engine libera no proximo frame; ate la nao toca nem pensa
+			// Desligada, nao apagada: outras entidades guardam ponteiros crus para ela desde o Activate (ex.: o
+			// monstro para o scripted_sequence dele). Apagada, a memoria era liberada e a proxima chamada por esse
+			// ponteiro derrubava o jogo (v1.19.4, ao voltar para o c_start).
+			if (k >= (int)g_neutral.size())
+				g_neutral.resize(k + 1, 0);
+			g_neutral[k] = e->serialnumber + 1;
 			e->v.solid = SOLID_NOT;
+			e->v.movetype = MOVETYPE_NONE;
+			e->v.velocity = Vector(0, 0, 0);
 			e->v.effects |= EF_NODRAW;
 			e->v.nextthink = 0;
+			e->v.takedamage = DAMAGE_NO;
+			e->v.flags = (e->v.flags & ~FL_MONSTER) | FL_NOTARGET;
 			g_eng->pfnSetOrigin(e, e->v.origin);
 			n++;
 		}
@@ -1270,7 +1293,7 @@ static void MapMemRestore()
 	for (const auto& d : m.lock)
 		if (same(d.first, e))
 			Field<int>(e->pvPrivateData, OFS_DOOR_LOCK) = d.second.empty() ? 0 : g_eng->pfnAllocString(d.second.c_str());
-	Log("mapa %s como foi deixado: %d entidade(s) apagada(s), %d com visibilidade trocada, %d porta(s) com a trava trocada",
+	Log("mapa %s como foi deixado: %d entidade(s) desligada(s), %d com visibilidade trocada, %d porta(s) com a trava trocada",
 		STRING(gpGlobals->mapname), n, (int)m.nodraw.size(), (int)m.lock.size());
 }
 
@@ -1493,7 +1516,7 @@ struct ActorScope
 	~ActorScope() { g_actor = old; }
 };
 
-static edict_t* Hook_FindEntityByString(edict_t* start, const char* field, const char* value)
+static edict_t* FindByStringForActor(edict_t* start, const char* field, const char* value)
 {
 	edict_t* a = g_actor;
 	if (!a || a->free || !field || !value || strcmp(field, "classname") || strcmp(value, "player"))
@@ -1503,6 +1526,22 @@ static edict_t* Hook_FindEntityByString(edict_t* start, const char* field, const
 	edict_t* e = g_eng->pfnFindEntityByString(start == a ? NULL : start, field, value);
 	if (e == a)
 		e = g_eng->pfnFindEntityByString(e, field, value);
+	return e;
+}
+
+static edict_t* Hook_FindEntityByString(edict_t* start, const char* field, const char* value)
+{
+	edict_t* e = FindByStringForActor(start, field, value);
+	while (IsNeutral(e))
+		e = FindByStringForActor(e, field, value);
+	return e;
+}
+
+static edict_t* Hook_FindEntityInSphere(edict_t* start, const float* org, float rad)
+{
+	edict_t* e = g_eng->pfnFindEntityInSphere(start, org, rad);
+	while (IsNeutral(e))
+		e = g_eng->pfnFindEntityInSphere(e, org, rad);
 	return e;
 }
 
@@ -3155,6 +3194,8 @@ static bool PickupTouch(edict_t* item, edict_t* player);
 
 static void Hook_Touch(edict_t* touched, edict_t* other)
 {
+	if (IsNeutral(touched) || IsNeutral(other))
+		return;
 	ActorScope actor(IsPlayer(other) ? other : IsPlayer(touched) ? touched : NULL);
 	if (cv_touchlog.value && IsTriggerEnt(touched) && !IsNull(other) && (other->v.flags & FL_CLIENT))
 	{
@@ -3193,6 +3234,8 @@ static void Hook_Touch(edict_t* touched, edict_t* other)
 
 static void Hook_Think(edict_t* ent)
 {
+	if (IsNeutral(ent))
+		return;
 	// o engine zera nextthink antes de chamar Think: reagenda para tentar de novo
 	if (g_hold.active && !IsNull(ent) && !strcmp(STRING(ent->v.classname), "trigger_auto"))
 	{
@@ -3312,6 +3355,7 @@ static void Hook_ServerActivate(edict_t* list, int count, int clientMax)
 		g_mapMem.clear();
 	}
 	g_padUser.clear();
+	g_neutral.clear();
 	MapMemSnapshot();
 	if (arrived && !g_transit.landmark.empty())
 		MapMemRestore();
@@ -3674,6 +3718,41 @@ static void Hook_ClientCommand(edict_t* e)
 			seen[i].clear();
 	}
 	ActorScope actor(e);
+	// Atalhos numericos: dois atalhos apertados em 0.25 s viram dual wield. O jogo faz isso no quicksel, mas so fora
+	// do multiplayer (pergunta a regra antes); aqui as duas armas dos atalhos vao pelo mesmo caminho do inventario.
+	if (i > 0 && i < 33 && g_DualWield && e->pvPrivateData && cv_enable.value && gpGlobals->maxClients > 1 &&
+		!strcmp(name, "quicksel") && IsAlive(e))
+	{
+		static int last[33];
+		static float until[33];
+		int n = atoi(g_eng->pfnCmd_Argv(1)), prev = last[i];
+		bool both = n >= 1 && n <= 3 && prev && prev != n && gpGlobals->time < until[i];
+		last[i] = n >= 1 && n <= 3 ? n : 0;
+		until[i] = gpGlobals->time + 0.25f;
+		if (both)
+		{
+			void* pl = e->pvPrivateData;
+			auto slotOf = [pl](int quick) {
+				const char* cls = (const char*)pl + OFS_QUICK_SLOT + (quick - 1) * QUICK_SLOT_LEN;
+				for (int k = 0; k < 7 && cls[0]; k++)
+				{
+					int s = Field<int>(pl, OFS_INV_CLASS + k * 4);
+					if (s && !strcmp(STRING(s), cls))
+						return k;
+				}
+				return -1;
+			};
+			int a = slotOf(n), b = slotOf(prev);
+			if (a >= 0 && b >= 0 && a != b)
+			{
+				Log("jogador %d: atalhos %d e %d juntos = dual wield (inventario %d e %d)", i, prev, n, b, a);
+				g_DualWield(pl, b, a);
+				SelectWeapon(i, e, "weapon_dualweapon");
+				last[i] = 0;
+				return;
+			}
+		}
+	}
 	if (i > 0 && i < 33 && g_DualWield && e->pvPrivateData && cv_enable.value && gpGlobals->maxClients > 1 &&
 		!strcmp(name, "inventorydualwield"))
 	{
@@ -5361,6 +5440,7 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	g_engForHL.pfnCreateNamedEntity = Hook_CreateNamedEntity;
 	g_engForHL.pfnRemoveEntity = Hook_RemoveEntity;
 	g_engForHL.pfnFindEntityByString = Hook_FindEntityByString;
+	g_engForHL.pfnFindEntityInSphere = Hook_FindEntityInSphere;
 	g_engForHL.pfnMessageBegin = Hook_MessageBegin;
 	g_engForHL.pfnMessageEnd = Hook_MessageEnd;
 	g_engForHL.pfnWriteByte = Hook_WriteByte;

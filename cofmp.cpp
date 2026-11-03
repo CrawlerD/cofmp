@@ -2920,6 +2920,63 @@ static void CoopSave(const char* why, edict_t* asker)
 	Log("salvando a partida em SAVE\\%s.sav (%s)", name, why);
 }
 
+// ---------------------------------------------------------------- fps acima de 100
+//
+// O Host_FilterTime do hw.dll le o fps_max e, quando developer == 0, corta o valor em 100:
+//   if (developer.value == 0 && fps > 100) fps = 100;
+// O config.cfg do CoF pede fps_max 111, mas o jogo ficava preso em 100 por causa desse teste.
+// Trocamos o "je" do teste do developer (RVA 0x7eb25, 74 2C) por um "jmp" (EB 2C): o clamp
+// deixa de ser aplicado e o fps_max volta a valer. O fps_max continua sendo o limite real.
+
+static const DWORD RVA_FPS_CLAMP = 0x7eb25;
+static const char SIG_FPS_CLAMP[] = "\x74\x2C\xD9\x45\xFC\xDC\x1D"; // je +0x2c; fld [ebp-4]; fcomp 100.0
+static bool g_fpsUnlocked;
+
+static bool UnlockFps()
+{
+	if (g_fpsUnlocked)
+		return true;
+	BYTE* hw = (BYTE*)GetModuleHandleA("hw.dll");
+	BYTE* p = hw ? hw + RVA_FPS_CLAMP : NULL;
+	if (!p || !SigMatch(p, SIG_FPS_CLAMP, sizeof(SIG_FPS_CLAMP) - 1))
+	{
+		Log("aviso: o Host_FilterTime do hw.dll nao confere (outra versao?) - fps acima de 100 desligado");
+		return false;
+	}
+	DWORD old;
+	if (!VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	p[0] = 0xEB; // jmp: nunca aplica o limite de 100 (como o developer != 0 faz)
+	VirtualProtect(p, 2, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), p, 2);
+	g_fpsUnlocked = true;
+	Log("fps acima de 100 liberado (limite de 100 do Host_FilterTime removido)");
+	return true;
+}
+
+// cofmp_fps [n]: mostra ou troca o fps_max (o teto de 100 ja sai ao carregar a DLL)
+static void Cmd_Fps()
+{
+	if (g_eng->pfnCmd_Argc() < 2)
+	{
+		Log("fps_max = %.0f; limite de 100 %s", g_eng->pfnCVarGetFloat("fps_max"),
+			g_fpsUnlocked ? "liberado" : "ativo");
+		return;
+	}
+	float v = (float)atof(g_eng->pfnCmd_Argv(1));
+	if (v < 20)
+		v = 20;
+	if (v > 1000)
+		v = 1000;
+	g_eng->pfnCVarSetFloat("fps_max", v);
+	if (v > 100 && !UnlockFps())
+	{
+		Log("fps_max = %.0f, mas o limite de 100 continua (hw.dll de outra versao)", v);
+		return;
+	}
+	Log("fps_max = %.0f%s", v, g_fpsUnlocked ? " (limite de 100 liberado)" : "");
+}
+
 // ---------------------------------------------------------------- espera antes das cutscenes
 //
 // No SP a cutscene comeca quando o jogador entra num trigger_once/trigger_multiple cuja cadeia de alvos
@@ -3244,6 +3301,7 @@ static void Hook_GameInit()
 	g_eng->pfnAddServerCommand((char*)"cofmp_go", Cmd_Go);
 	g_eng->pfnAddServerCommand((char*)"cofmp_map", Cmd_Map);
 	g_eng->pfnAddServerCommand((char*)"cofmp_teste", Cmd_Teste);
+	g_eng->pfnAddServerCommand((char*)"cofmp_fps", Cmd_Fps);
 	g_orig.pfnGameInit();
 	Log("carregado (co-op da campanha)");
 }
@@ -5352,6 +5410,12 @@ extern "C" void __stdcall GiveFnptrsToDll(enginefuncs_t* eng, globalvars_t* glob
 	{
 		savePatched = true;
 		InstallSavePatch();
+	}
+	static bool fpsPatched;
+	if (!fpsPatched)
+	{
+		fpsPatched = true;
+		UnlockFps();
 	}
 	if (!LoadHL())
 		return;
